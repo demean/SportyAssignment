@@ -26,7 +26,8 @@ public record PlaceBetRequest(
         @NotBlank @Pattern(regexp = Bet.ID_REGEX) String userId,
         @Schema(description = "Jackpot id", example = "jackpot-lucky")
         @NotBlank @Pattern(regexp = Bet.ID_REGEX) String jackpotId,
-        @Schema(description = "Stake", example = "250.00")
+        @Schema(description = "Stake: 0.01 to 1,000,000,000.00, at most 2 decimals, a JSON number (not a string)",
+                example = "250.00")
         @NotNull @DecimalMin("0.01") @DecimalMax("1000000000.00") @Digits(integer = 10, fraction = 2)
         BigDecimal betAmount) {
 }

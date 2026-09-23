@@ -172,5 +172,15 @@ class VariableChanceRewardPolicyTest {
                     .isInstanceOf(JackpotConfigurationException.class)
                     .hasMessage("poolLimit (" + limit + ") must be greater than the initial pool (" + initialPool + ")");
         }
+
+        @Test
+        @DisplayName("validateFor quotes an extreme pool limit in scientific notation (no billion-digit message)")
+        void validateForQuotesAnExtremeLimitBounded() {
+            VariableChanceRewardPolicy policy = policy("1", "1", "10", "1e-999999999");
+
+            assertThatThrownBy(() -> policy.validateFor(new BigDecimal("100.00")))
+                    .isInstanceOf(JackpotConfigurationException.class)
+                    .hasMessage("poolLimit (1E-999999999) must be greater than the initial pool (100.00)");
+        }
     }
 }

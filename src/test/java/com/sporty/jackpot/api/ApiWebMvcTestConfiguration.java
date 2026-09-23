@@ -10,13 +10,13 @@ import org.springframework.context.annotation.Import;
 
 /**
  * Beans the {@code @WebMvcTest} slices of the API need but do not scan: the real {@link ApiMapper} and a fixed
- * clock, so {@code placedAt}/{@code timestamp} values are deterministic.
+ * clock, so the {@code timestamp} of problem responses is deterministic.
  */
 @TestConfiguration(proxyBeanMethods = false)
 @Import(ApiMapper.class)
 public class ApiWebMvcTestConfiguration {
 
-    /** The instant every controller and problem response of the slice sees (microsecond precision). */
+    /** The instant of the slice's clock (microsecond precision); the tests also accept their bets at it. */
     public static final Instant NOW = Instant.parse("2026-09-23T10:15:30.123456Z");
 
     @Bean

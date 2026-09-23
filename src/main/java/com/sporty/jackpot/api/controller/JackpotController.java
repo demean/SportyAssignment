@@ -34,6 +34,8 @@ public class JackpotController {
 
     @GetMapping
     @Operation(summary = "List all jackpots")
+    @ApiResponse(responseCode = "200", description = "All jackpots, ordered by id")
+    @ApiResponse(responseCode = "503", description = BetController.TEMPORARILY_UNAVAILABLE_DESCRIPTION)
     public List<JackpotResponse> getJackpots() {
         return queryService.findAll().stream().map(apiMapper::toResponse).toList();
     }
@@ -41,7 +43,9 @@ public class JackpotController {
     @GetMapping("/{jackpotId}")
     @Operation(summary = "Get a jackpot")
     @ApiResponse(responseCode = "200", description = "The jackpot")
+    @ApiResponse(responseCode = "400", description = BetController.INVALID_ID_DESCRIPTION)
     @ApiResponse(responseCode = "404", description = "JACKPOT_NOT_FOUND")
+    @ApiResponse(responseCode = "503", description = BetController.TEMPORARILY_UNAVAILABLE_DESCRIPTION)
     public JackpotResponse getJackpot(@PathVariable @Pattern(regexp = Bet.ID_REGEX) String jackpotId) {
         return apiMapper.toResponse(queryService.getJackpot(jackpotId));
     }

@@ -4,6 +4,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.within;
 
 import java.time.Clock;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.temporal.ChronoUnit;
@@ -36,6 +37,9 @@ class ClockConfigTest {
         runner.run(context -> {
             Clock clock = context.getBean(Clock.class);
 
+            // deterministic on every platform: the system clock of macOS already has microsecond resolution only,
+            // so sampling alone could not tell a ticking clock from the plain system clock there
+            assertThat(clock).isEqualTo(Clock.tick(Clock.systemUTC(), Duration.ofNanos(1_000)));
             assertThat(IntStream.range(0, 1_000).mapToObj(i -> clock.instant()))
                     .allSatisfy(instant -> assertThat(instant.truncatedTo(ChronoUnit.MICROS)).isEqualTo(instant));
         });

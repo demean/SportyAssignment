@@ -29,9 +29,18 @@ class FixedChanceRewardPolicyTest {
     }
 
     @ParameterizedTest(name = "{0} -> {1}")
-    @CsvSource({"0, 0.0000", "100, 100.0000", "0.01, 0.0100", "0.00005, 0.0000", "0.00015, 0.0002"})
-    void normalizedToScaleFourHalfEven(String configured, String expected) {
+    @CsvSource({"0, 0.0000", "100, 100.0000", "0.01, 0.0100", "0.0001, 0.0001", "1.00000, 1.0000"})
+    void normalizedToScaleFour(String configured, String expected) {
         assertThat(policy(configured).winChancePercentage(INITIAL, INITIAL)).isEqualTo(new BigDecimal(expected));
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @ValueSource(strings = {"0.00005", "0.00015"})
+    @DisplayName("a chance finer than the draw resolution (0.0001 %) is rejected, not silently rounded")
+    void rejectsMoreThanFourDecimals(String chance) {
+        assertThatThrownBy(() -> policy(chance))
+                .isInstanceOf(JackpotConfigurationException.class)
+                .hasMessage("chancePercentage must have at most 4 decimals but was " + chance);
     }
 
     @ParameterizedTest(name = "{0}")
@@ -40,6 +49,17 @@ class FixedChanceRewardPolicyTest {
         assertThatThrownBy(() -> policy(chance))
                 .isInstanceOf(JackpotConfigurationException.class)
                 .hasMessage("chancePercentage must be within [0, 100] but was " + chance);
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @CsvSource(delimiter = '|', value = {
+            "1e-999999999 | chancePercentage must have at most 4 decimals but was 1E-999999999",
+            "1e999999999  | chancePercentage must be within [0, 100] but was 1E+999999999"})
+    @DisplayName("an extreme exponent is a configuration error quoted in scientific notation, not an OutOfMemoryError")
+    void rejectsExtremeExponentsWithABoundedMessage(String chance, String message) {
+        assertThatThrownBy(() -> policy(chance))
+                .isInstanceOf(JackpotConfigurationException.class)
+                .hasMessage(message);
     }
 
     @Test

@@ -10,13 +10,16 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.CompletableFuture;
 import java.util.function.BiFunction;
 import java.util.stream.Stream;
 import org.apache.kafka.clients.admin.NewTopic;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.producer.ProducerConfig;
+import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.config.TopicConfig;
+import org.apache.kafka.common.errors.RecordTooLargeException;
 import org.apache.kafka.common.errors.RetriableException;
 import org.apache.kafka.common.serialization.ByteArraySerializer;
 import org.apache.kafka.common.serialization.Serializer;
@@ -31,6 +34,7 @@ import org.springframework.dao.DataAccessResourceFailureException;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.dao.RecoverableDataAccessException;
 import org.springframework.dao.TransientDataAccessException;
+import org.springframework.kafka.KafkaException;
 import org.springframework.kafka.config.ContainerCustomizer;
 import org.springframework.kafka.config.TopicBuilder;
 import org.springframework.kafka.core.DefaultKafkaProducerFactory;
@@ -42,9 +46,12 @@ import org.springframework.kafka.listener.ContainerProperties;
 import org.springframework.kafka.listener.DeadLetterPublishingRecoverer;
 import org.springframework.kafka.listener.DefaultErrorHandler;
 import org.springframework.kafka.support.ExponentialBackOffWithMaxRetries;
+import org.springframework.kafka.support.KafkaUtils;
+import org.springframework.kafka.support.SendResult;
 import org.springframework.kafka.support.serializer.DelegatingByTypeSerializer;
 import org.springframework.kafka.support.serializer.JacksonJsonSerializer;
 import org.springframework.transaction.CannotCreateTransactionException;
+import org.springframework.util.StringUtils;
 import org.springframework.util.backoff.BackOff;
 import org.springframework.util.backoff.ExponentialBackOff;
 
@@ -57,6 +64,10 @@ import org.springframework.util.backoff.ExponentialBackOff;
 public class KafkaConfig {
 
     static final String DEAD_LETTERED_COUNTER = "jackpot.bets.dead-lettered";
+    static final String DEAD_LETTER_FAILED_COUNTER = "jackpot.bets.dead-letter-failed";
+
+    /** Longest record key or failure description logged per dead-lettered record (both may echo untrusted input). */
+    static final int MAX_LOGGED_LENGTH = 500;
 
     private static final Logger log = LoggerFactory.getLogger(KafkaConfig.class);
 
@@ -73,6 +84,9 @@ public class KafkaConfig {
             DataAccessResourceFailureException.class,
             SQLTransientException.class,
             RetriableException.class);
+    /** Deterministic dead-letter publication failure: retrying the same record can never succeed. */
+    private static final List<Class<? extends Throwable>> OVERSIZED_DEAD_LETTER =
+            List.of(RecordTooLargeException.class);
 
     @Bean
     NewTopic betsTopic(JackpotProperties properties) {
@@ -110,14 +124,14 @@ public class KafkaConfig {
 
     /**
      * Listener error handling: deterministic failures go to the dead-letter topic immediately, transient DB/Kafka
-     * failures are retried indefinitely (the partition blocks, nothing is lost), anything else is retried
-     * {@code maxRetries} times and then dead-lettered.
+     * failures are retried indefinitely (the consumer thread and all its partitions wait, nothing is lost), anything
+     * else is retried {@code maxRetries} times and then dead-lettered.
      */
     @Bean
     CommonErrorHandler kafkaErrorHandler(KafkaOperations<Object, Object> kafkaOperations, JackpotProperties properties,
                                          MeterRegistry meterRegistry) {
         JackpotProperties.Kafka kafka = properties.kafka();
-        DeadLetterPublishingRecoverer deadLetterPublisher = new DeadLetterPublishingRecoverer(kafkaOperations,
+        DeadLetterPublishingRecoverer deadLetterPublisher = new DeadLetterPublisher(kafkaOperations,
                 deadLetterDestination(kafka.deadLetterTopic()));
         JackpotProperties.Retry retry = kafka.consumer().retry();
         DefaultErrorHandler errorHandler = new DefaultErrorHandler(
@@ -178,16 +192,36 @@ public class KafkaConfig {
     }
 
     /**
-     * Logs every record before delegating and counts it ({@value #DEAD_LETTERED_COUNTER}) once the delegate has
-     * dead-lettered it; a failed dead-letter publication propagates (the record is retried) and is not counted.
+     * Logs every record before delegating (key and failure cut to {@value #MAX_LOGGED_LENGTH} characters) and counts
+     * it ({@value #DEAD_LETTERED_COUNTER}) once the delegate has dead-lettered it.
+     *
+     * <p>A failed dead-letter publication propagates, so the record is retried, and is not counted. The one exception
+     * is a dead-letter record that is too large for the producer or the broker ({@link RecordTooLargeException}):
+     * that failure is deterministic, and retrying it would block the partition forever. Such a record is logged once
+     * with its coordinates, counted as {@value #DEAD_LETTER_FAILED_COUNTER} and acknowledged; the original stays in
+     * the bets topic at the logged offset (within its retention) for a replay.
      */
     static ConsumerRecordRecoverer countingRecoverer(ConsumerRecordRecoverer delegate, MeterRegistry meterRegistry) {
         return (consumerRecord, exception) -> {
             Throwable rootCause = NestedExceptionUtils.getMostSpecificCause(exception);
+            String exceptionTag = rootCause.getClass().getSimpleName();
+            String key = StringUtils.truncate(String.valueOf(consumerRecord.key()), MAX_LOGGED_LENGTH);
             log.error("Dead-lettering record {}-{}@{} (key={}): {}", consumerRecord.topic(), consumerRecord.partition(),
-                    consumerRecord.offset(), consumerRecord.key(), rootCause.toString());
-            delegate.accept(consumerRecord, exception);
-            meterRegistry.counter(DEAD_LETTERED_COUNTER, "exception", rootCause.getClass().getSimpleName()).increment();
+                    consumerRecord.offset(), key, StringUtils.truncate(rootCause.toString(), MAX_LOGGED_LENGTH));
+            try {
+                delegate.accept(consumerRecord, exception);
+            } catch (RuntimeException publicationFailure) {
+                if (!causeChainContains(publicationFailure, OVERSIZED_DEAD_LETTER)) {
+                    throw publicationFailure;
+                }
+                log.error("Record {}-{}@{} (key={}) was NOT dead-lettered: the dead-letter record is too large to "
+                                + "publish. The record is acknowledged; replay it from that topic, partition and "
+                                + "offset",
+                        consumerRecord.topic(), consumerRecord.partition(), consumerRecord.offset(), key);
+                meterRegistry.counter(DEAD_LETTER_FAILED_COUNTER, "exception", exceptionTag).increment();
+                return;
+            }
+            meterRegistry.counter(DEAD_LETTERED_COUNTER, "exception", exceptionTag).increment();
         };
     }
 
@@ -198,9 +232,41 @@ public class KafkaConfig {
 
     /** Whether the cause chain contains a transient (retry-until-it-works) DB or Kafka failure. */
     static boolean isTransient(Throwable exception) {
+        return causeChainContains(exception, TRANSIENT_FAILURES);
+    }
+
+    /** Whether the (possibly cyclic) cause chain contains an instance of one of {@code types}. */
+    private static boolean causeChainContains(Throwable exception, List<Class<? extends Throwable>> types) {
         return Stream.iterate(exception, Objects::nonNull, Throwable::getCause)
                 .limit(MAX_CAUSE_DEPTH)
-                .anyMatch(cause -> TRANSIENT_FAILURES.stream().anyMatch(type -> type.isInstance(cause)));
+                .anyMatch(cause -> types.stream().anyMatch(type -> type.isInstance(cause)));
+    }
+
+    /**
+     * Dead-letter publisher whose failed publication always carries its cause. The base class logs a send that fails
+     * synchronously (e.g. a record over {@code max.request.size}, rejected by the producer before it is sent) and then
+     * throws a {@code KafkaException} without a cause, which would hide that deterministic failure from
+     * {@link #countingRecoverer}. Every publication is verified (awaited), as by the base class's default.
+     */
+    static final class DeadLetterPublisher extends DeadLetterPublishingRecoverer {
+
+        DeadLetterPublisher(KafkaOperations<?, ?> template,
+                            BiFunction<ConsumerRecord<?, ?>, Exception, TopicPartition> destinationResolver) {
+            super(template, destinationResolver);
+        }
+
+        @Override
+        protected void publish(ProducerRecord<Object, Object> outRecord, KafkaOperations<Object, Object> kafkaTemplate,
+                               ConsumerRecord<?, ?> inRecord) {
+            CompletableFuture<SendResult<Object, Object>> sendResult;
+            try {
+                sendResult = kafkaTemplate.send(outRecord);
+            } catch (RuntimeException e) {
+                throw new KafkaException("Dead-letter publication to " + outRecord.topic() + " failed for: "
+                        + KafkaUtils.format(inRecord), e);
+            }
+            verifySendResult(kafkaTemplate, outRecord, sendResult, inRecord);
+        }
     }
 
     @SuppressWarnings({"unchecked", "rawtypes"})

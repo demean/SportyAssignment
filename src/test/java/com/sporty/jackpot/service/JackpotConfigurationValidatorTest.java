@@ -15,6 +15,7 @@ import com.sporty.jackpot.domain.policy.VariableChanceRewardPolicy;
 import com.sporty.jackpot.domain.policy.VariableContributionPolicy;
 import com.sporty.jackpot.exception.ErrorCode;
 import com.sporty.jackpot.exception.JackpotConfigurationException;
+import com.sporty.jackpot.support.LogCapture;
 import java.math.BigDecimal;
 import java.time.Instant;
 import java.util.List;
@@ -25,8 +26,6 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
-import org.springframework.boot.ApplicationArguments;
-import org.springframework.boot.DefaultApplicationArguments;
 import org.springframework.boot.jdbc.autoconfigure.JdbcConnectionDetails;
 
 @ExtendWith(MockitoExtension.class)
@@ -36,7 +35,6 @@ class JackpotConfigurationValidatorTest {
     private static final String POSTGRES_URL = "jdbc:postgresql://localhost:5432/jackpot";
     private static final String H2_WARNING = "Running on the in-memory H2 database: data is volatile and only a single "
             + "instance is supported (use the 'postgres' profile to scale horizontally)";
-    private static final ApplicationArguments NO_ARGS = new DefaultApplicationArguments();
 
     @Mock
     private JackpotQueryService jackpotQueryService;
@@ -73,8 +71,8 @@ class JackpotConfigurationValidatorTest {
         JackpotConfigurationValidator validator = validator(POSTGRES_URL, fixedJackpot("jackpot-fixed"),
                 variableJackpot("jackpot-variable", "5000.00", "25000"));
 
-        try (ServiceLogCapture logs = ServiceLogCapture.of(JackpotConfigurationValidator.class)) {
-            assertThatNoException().isThrownBy(() -> validator.run(NO_ARGS));
+        try (LogCapture logs = LogCapture.of(JackpotConfigurationValidator.class)) {
+            assertThatNoException().isThrownBy(validator::afterSingletonsInstantiated);
 
             assertThat(logs.messages(Level.INFO)).containsExactly("Validated the configuration of 2 jackpot(s)");
         }
@@ -85,8 +83,8 @@ class JackpotConfigurationValidatorTest {
     void noJackpotsPass() {
         JackpotConfigurationValidator validator = validator(POSTGRES_URL);
 
-        try (ServiceLogCapture logs = ServiceLogCapture.of(JackpotConfigurationValidator.class)) {
-            assertThatNoException().isThrownBy(() -> validator.run(NO_ARGS));
+        try (LogCapture logs = LogCapture.of(JackpotConfigurationValidator.class)) {
+            assertThatNoException().isThrownBy(validator::afterSingletonsInstantiated);
 
             assertThat(logs.messages(Level.INFO)).containsExactly("Validated the configuration of 0 jackpot(s)");
         }
@@ -100,8 +98,9 @@ class JackpotConfigurationValidatorTest {
                 variableJackpot("jackpot-bad", "1000.00", poolLimit));
 
         JackpotConfigurationException exception;
-        try (ServiceLogCapture logs = ServiceLogCapture.of(JackpotConfigurationValidator.class)) {
-            exception = catchThrowableOfType(JackpotConfigurationException.class, () -> validator.run(NO_ARGS));
+        try (LogCapture logs = LogCapture.of(JackpotConfigurationValidator.class)) {
+            exception = catchThrowableOfType(JackpotConfigurationException.class,
+                    validator::afterSingletonsInstantiated);
 
             assertThat(logs.messages(Level.INFO)).as("never reports success").isEmpty();
         }
@@ -123,8 +122,8 @@ class JackpotConfigurationValidatorTest {
     void warnsOnInMemoryH2(String jdbcUrl) {
         JackpotConfigurationValidator validator = validator(jdbcUrl, fixedJackpot("jackpot-fixed"));
 
-        try (ServiceLogCapture logs = ServiceLogCapture.of(JackpotConfigurationValidator.class)) {
-            validator.run(NO_ARGS);
+        try (LogCapture logs = LogCapture.of(JackpotConfigurationValidator.class)) {
+            validator.afterSingletonsInstantiated();
 
             assertThat(logs.messages(Level.WARN)).containsExactly(H2_WARNING);
         }
@@ -140,8 +139,8 @@ class JackpotConfigurationValidatorTest {
     void noWarningOnOtherDatabases(String jdbcUrl) {
         JackpotConfigurationValidator validator = validator(jdbcUrl, fixedJackpot("jackpot-fixed"));
 
-        try (ServiceLogCapture logs = ServiceLogCapture.of(JackpotConfigurationValidator.class)) {
-            validator.run(NO_ARGS);
+        try (LogCapture logs = LogCapture.of(JackpotConfigurationValidator.class)) {
+            validator.afterSingletonsInstantiated();
 
             assertThat(logs.messages(Level.WARN)).isEmpty();
         }

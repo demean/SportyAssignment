@@ -6,9 +6,12 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.params.provider.Arguments.arguments;
 
+import com.sporty.jackpot.domain.model.Bet;
 import com.sporty.jackpot.exception.InvalidBetException;
 import com.sporty.jackpot.exception.JackpotConfigurationException;
 import com.sporty.jackpot.support.DeadLetterReader;
+import com.sporty.jackpot.support.TestJackpots;
+import io.micrometer.core.instrument.Counter;
 import java.nio.charset.StandardCharsets;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
@@ -46,6 +49,8 @@ import org.springframework.test.web.servlet.assertj.MvcTestResult;
 @DisplayName("Kafka error handling and dead-lettering (Embedded Kafka)")
 class KafkaErrorHandlingIntegrationTest extends AbstractEndToEndIntegrationTest {
 
+    private static final String DEAD_LETTER_FAILED_COUNTER = "jackpot.bets.dead-letter-failed";
+
     private static final String VALID_BET_TEMPLATE = """
             {"betId":"%s","userId":"user-e2e","jackpotId":"%s","betAmount":100.00,\
             "placedAt":"2026-01-01T00:00:00Z"%s}""";
@@ -62,7 +67,14 @@ class KafkaErrorHandlingIntegrationTest extends AbstractEndToEndIntegrationTest 
                         {"betId":"b-1","userId":"u","jackpotId":"j","betAmount":"a lot",\
                         "placedAt":"2026-01-01T00:00:00Z"}""")),
                 arguments("unparsable timestamp", utf8("""
-                        {"betId":"b-1","userId":"u","jackpotId":"j","betAmount":1.00,"placedAt":"yesterday"}""")));
+                        {"betId":"b-1","userId":"u","jackpotId":"j","betAmount":1.00,"placedAt":"yesterday"}""")),
+                // parsed as strictly as the API: never last-wins on the stake, never a string coerced into it
+                arguments("a duplicate betAmount key", utf8("""
+                        {"betId":"b-1","userId":"u","jackpotId":"j","betAmount":1.00,"betAmount":1000000000.00,\
+                        "placedAt":"2026-01-01T00:00:00Z"}""")),
+                arguments("the amount as a JSON string", utf8("""
+                        {"betId":"b-1","userId":"u","jackpotId":"j","betAmount":"250.00",\
+                        "placedAt":"2026-01-01T00:00:00Z"}""")));
     }
 
     @ParameterizedTest(name = "{0}")
@@ -103,7 +115,15 @@ class KafkaErrorHandlingIntegrationTest extends AbstractEndToEndIntegrationTest 
                 arguments("blank user id", "userId", "\"\"", "userId must match"),
                 arguments("illegal characters in the jackpot id", "jackpotId", "\"jackpot one!\"",
                         "jackpotId must match"),
-                arguments("missing placedAt", "placedAt", null, "placedAt must not be null"));
+                arguments("missing placedAt", "placedAt", null, "placedAt must not be null"),
+                // 11 bytes of JSON whose plain form has a billion digits: formatting it used to kill the consumers
+                arguments("huge positive exponent", "betAmount", "1e999999999",
+                        "amount must not exceed 1000000000.00 but was 1E+999999999"),
+                arguments("huge negative exponent", "betAmount", "1e-3000000",
+                        "amount must have at most 2 decimals but was 1E-3000000"),
+                arguments("negative huge exponent", "betAmount", "-1e999999999",
+                        "amount must be positive but was -1E+999999999"),
+                arguments("a dot segment as jackpot id", "jackpotId", "\"..\"", "jackpotId must match"));
     }
 
     @ParameterizedTest(name = "{0}")
@@ -136,6 +156,76 @@ class KafkaErrorHandlingIntegrationTest extends AbstractEndToEndIntegrationTest 
         awaitStatus(HttpStatus.OK, "/api/v1/bets/{betId}/evaluation", nextBetId);
         assertThat(ledger.rowsOfBet("bet", invalidBetId)).isZero();
         assertThat(jackpots.pool(jackpotId)).as("only the valid bet contributed").isEqualByComparingTo("1005.00");
+    }
+
+    @Test
+    @DisplayName("an invalid 350,000-character bet id is dead-lettered with a bounded message; the partition moves on")
+    void invalidHugeBetIdIsDeadLetteredWithABoundedMessage() {
+        String jackpotId = jackpots.create("1000.00", fixedContribution("5.0"), fixedChance("0"));
+        String hugeBetId = "b".repeat(350_000);
+        String nextBetId = uniqueId("bet");
+
+        try (DeadLetterReader deadLetters = openDeadLetterReader()) {
+            sendJson(jackpotId, betJsonWithField(uniqueId("unused"), jackpotId, "betId", "\"" + hugeBetId + "\""));
+            sendEvent(event(nextBetId, jackpotId, "100.00"));
+
+            ConsumerRecord<String, byte[]> dead = deadLetters.await(DeadLetterReader.withKey(jackpotId));
+
+            assertThat(DeadLetterReader.header(dead, KafkaHeaders.DLT_EXCEPTION_MESSAGE))
+                    .contains("betId must match " + Bet.ID_REGEX + " but was '" + "b".repeat(80) + "...'")
+                    .endsWith("(350000 characters)")
+                    .hasSizeLessThan(1_000);
+            assertThat(DeadLetterReader.value(dead)).as("the payload itself is kept").contains(hugeBetId);
+        }
+        awaitStatus(HttpStatus.OK, "/api/v1/bets/{betId}/evaluation", nextBetId);
+        assertThat(jackpots.pool(jackpotId)).isEqualByComparingTo("1005.00");
+    }
+
+    @Test
+    @DisplayName("a record whose dead-letter copy is too large is logged, counted and skipped; the partition moves on")
+    void recordTooLargeToDeadLetterDoesNotBlockThePartition() {
+        String jackpotId = jackpots.create("1000.00", fixedContribution("5.0"), fixedChance("0"));
+        String nextBetId = uniqueId("bet");
+        // just below the producer's 1 MiB max.request.size; the dead-letter copy adds the exception headers (KBs)
+        byte[] nearlyOneMebibyte = "x".repeat(1_048_000).getBytes(StandardCharsets.UTF_8);
+        double failedBefore = deadLetterFailures();
+
+        sendRaw(jackpotId, nearlyOneMebibyte);
+        sendEvent(event(nextBetId, jackpotId, "100.00"));
+
+        awaitStatus(HttpStatus.OK, "/api/v1/bets/{betId}/evaluation", nextBetId);
+        assertThat(jackpots.pool(jackpotId)).isEqualByComparingTo("1005.00");
+        assertThat(deadLetterFailures() - failedBefore).as("counted once, not retried forever").isEqualTo(1.0);
+        assertThat(deadLettersWithKey(jackpotId)).as("the oversized copy never reached the DLT").isEmpty();
+    }
+
+    @Test
+    @DisplayName("a jackpot changed at runtime to a pool limit not above its initial pool: its bets go to the DLT, "
+            + "nothing is paid")
+    void betOnJackpotMisconfiguredAtRuntimeIsDeadLettered() {
+        String jackpotId = uniqueId("runtime-misconfigured");
+        // every contributing bet would see the pool at or above the limit: chance 100 %, the whole pool paid out
+        jackpots.insert(jackpotId, "100.00", "100.00", 1, fixedContribution("5.0"),
+                TestJackpots.variableChance("0", "0", "10", "50"));
+        String betId = uniqueId("bet");
+        Map<String, Long> callsBefore = listenerCallsByError();
+        try (DeadLetterReader deadLetters = openDeadLetterReader()) {
+            sendEvent(event(betId, jackpotId, "100.00"));
+
+            ConsumerRecord<String, byte[]> dead = deadLetters.await(DeadLetterReader.withKey(jackpotId));
+
+            assertThat(DeadLetterReader.header(dead, KafkaHeaders.DLT_EXCEPTION_CAUSE_FQCN))
+                    .isEqualTo(JackpotConfigurationException.class.getName());
+            assertThat(DeadLetterReader.header(dead, KafkaHeaders.DLT_EXCEPTION_MESSAGE))
+                    .contains("Jackpot '" + jackpotId + "' is misconfigured: poolLimit (50) must be greater than the "
+                            + "initial pool (100.00)");
+            assertThat(listenerFailuresSince(callsBefore, causeOf(dead).getSimpleName()))
+                    .as("not retried: dead-lettered after the first attempt").isOne();
+        } finally {
+            jdbcTemplate.update("DELETE FROM jackpot WHERE id = ?", jackpotId);
+        }
+        assertThat(ledger.rowsOfBet("bet", betId)).isZero();
+        assertThat(ledger.rowsOfBet("jackpot_reward", betId)).as("nothing paid").isZero();
     }
 
     static Stream<Arguments> tolerablePayloadVariations() {
@@ -204,11 +294,24 @@ class KafkaErrorHandlingIntegrationTest extends AbstractEndToEndIntegrationTest 
         assertThat(jackpot.cycle()).isEqualTo(1);
     }
 
-    @Test
+    static Stream<Arguments> invalidStoredContributionPolicies() {
+        return Stream.of(
+                arguments("a percentage above 100", fixedContribution("150.0"),
+                        "percentage must be within [0, 100] but was 150.0"),
+                // 0 %: every bet would contribute 0.00 and never be drawn, so the jackpot could never be won
+                arguments("a fixed 0 % contribution", fixedContribution("0"), "percentage must be > 0 but was 0"),
+                arguments("a variable contribution decaying to a 0 % floor",
+                        TestJackpots.variableContribution("10.0", "0", "0.5", "1000"),
+                        "minPercentage must be > 0 but was 0"));
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("invalidStoredContributionPolicies")
     @DisplayName("a jackpot with an invalid stored policy dead-letters its bets as JackpotConfigurationException")
-    void betOnMisconfiguredJackpotIsDeadLettered() {
+    void betOnMisconfiguredJackpotIsDeadLettered(String description, String contributionPolicy,
+                                                 String expectedDetail) {
         String jackpotId = uniqueId("broken-jackpot");
-        jackpots.insert(jackpotId, "1000.00", "1000.00", 1, fixedContribution("150.0"), fixedChance("0"));
+        jackpots.insert(jackpotId, "1000.00", "1000.00", 1, contributionPolicy, fixedChance("0"));
         String betId = uniqueId("bet");
         Map<String, Long> callsBefore = listenerCallsByError();
         try (DeadLetterReader deadLetters = openDeadLetterReader()) {
@@ -220,7 +323,8 @@ class KafkaErrorHandlingIntegrationTest extends AbstractEndToEndIntegrationTest 
                     .as("not retried: dead-lettered after the first attempt").isOne();
             // Hibernate wraps the converter's exception; the error handler finds it in the cause chain
             assertThat(DeadLetterReader.header(dead, KafkaHeaders.DLT_EXCEPTION_STACKTRACE))
-                    .contains(JackpotConfigurationException.class.getName() + ": Invalid contribution policy JSON");
+                    .contains(JackpotConfigurationException.class.getName() + ": Invalid contribution policy JSON")
+                    .contains(expectedDetail);
         } finally {
             // the broken row must not outlive the test: listing all jackpots would fail for every other test
             jdbcTemplate.update("DELETE FROM jackpot WHERE id = ?", jackpotId);
@@ -276,6 +380,11 @@ class KafkaErrorHandlingIntegrationTest extends AbstractEndToEndIntegrationTest 
     private String consumerGroup() {
         MessageListenerContainer container = listenerRegistry.getListenerContainers().iterator().next();
         return container.getGroupId();
+    }
+
+    /** @return every dead-letter publication skipped so far because the record was too large (all tags) */
+    private double deadLetterFailures() {
+        return meterRegistry.find(DEAD_LETTER_FAILED_COUNTER).counters().stream().mapToDouble(Counter::count).sum();
     }
 
     private static Class<?> causeOf(ConsumerRecord<String, byte[]> dead) {

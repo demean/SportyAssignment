@@ -1,4 +1,4 @@
-package com.sporty.jackpot.service;
+package com.sporty.jackpot.support;
 
 import ch.qos.logback.classic.Level;
 import ch.qos.logback.classic.Logger;
@@ -8,24 +8,24 @@ import java.util.List;
 import org.slf4j.LoggerFactory;
 
 /**
- * Captures the Logback events of one class's logger for the service-area unit tests. The logger is forced to
+ * Captures the Logback events of one class's logger for unit tests. The logger is forced to
  * {@code DEBUG} while capturing (independent of whatever logging configuration an earlier Spring context in the same
  * JVM installed) and restored on {@link #close()}.
  *
  * <pre>{@code
- * try (ServiceLogCapture logs = ServiceLogCapture.of(BetProcessingService.class)) {
+ * try (LogCapture logs = LogCapture.of(BetProcessingService.class)) {
  *     service.process(bet);
  *     assertThat(logs.messages(Level.WARN)).singleElement().asString().contains("payload differs");
  * }
  * }</pre>
  */
-public final class ServiceLogCapture implements AutoCloseable {
+public final class LogCapture implements AutoCloseable {
 
     private final Logger logger;
     private final Level previousLevel;
     private final ListAppender<ILoggingEvent> appender = new ListAppender<>();
 
-    private ServiceLogCapture(Class<?> type) {
+    private LogCapture(Class<?> type) {
         this.logger = (Logger) LoggerFactory.getLogger(type);
         this.previousLevel = logger.getLevel();
         logger.setLevel(Level.DEBUG);
@@ -39,8 +39,8 @@ public final class ServiceLogCapture implements AutoCloseable {
      * @param type class whose logger is captured
      * @return the running capture (close it)
      */
-    public static ServiceLogCapture of(Class<?> type) {
-        return new ServiceLogCapture(type);
+    public static LogCapture of(Class<?> type) {
+        return new LogCapture(type);
     }
 
     /**

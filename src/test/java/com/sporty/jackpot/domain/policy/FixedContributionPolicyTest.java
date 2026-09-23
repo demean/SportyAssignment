@@ -37,8 +37,8 @@ class FixedContributionPolicyTest {
         }
 
         @ParameterizedTest(name = "{0} -> {1}")
-        @CsvSource({"0, 0.0000", "100, 100.0000", "2.5, 2.5000", "0.00005, 0.0000", "0.00015, 0.0002"})
-        void normalizedToScaleFourHalfEven(String configured, String expected) {
+        @CsvSource({"100, 100.0000", "2.5, 2.5000", "0.0001, 0.0001", "5.00000, 5.0000"})
+        void normalizedToScaleFour(String configured, String expected) {
             assertThat(policy(configured).contributionPercentage(INITIAL, INITIAL)).isEqualTo(new BigDecimal(expected));
         }
     }
@@ -52,7 +52,8 @@ class FixedContributionPolicyTest {
                 "100.00, 5.0, 5.00",
                 "250.00, 20, 50.00",
                 "1000000000.00, 100, 1000000000.00",
-                "123.45, 0, 0.00",
+                // the smallest percentage still lets a large enough stake contribute
+                "1000000000.00, 0.0001, 1000.00",
                 // cent ties HALF_EVEN, micro stakes contribute nothing
                 "0.10, 5, 0.00",
                 "0.30, 5, 0.02",
@@ -70,9 +71,28 @@ class FixedContributionPolicyTest {
     class Validation {
 
         @ParameterizedTest(name = "{0}")
-        @ValueSource(strings = {"0", "0.0000", "50", "100", "100.0000"})
-        void acceptsPercentagesWithinZeroAndHundred(String percentage) {
+        @ValueSource(strings = {"0.00005", "0.00015"})
+        @DisplayName("a percentage with more than 4 decimals is rejected, not silently rounded when used")
+        void rejectsMoreThanFourDecimals(String percentage) {
+            assertThatThrownBy(() -> policy(percentage))
+                    .isInstanceOf(JackpotConfigurationException.class)
+                    .hasMessage("percentage must have at most 4 decimals but was " + percentage);
+        }
+
+        @ParameterizedTest(name = "{0}")
+        @ValueSource(strings = {"0.0001", "50", "100", "100.0000"})
+        void acceptsPercentagesAboveZeroUpToHundred(String percentage) {
             assertThat(policy(percentage).percentage()).isEqualByComparingTo(percentage);
+        }
+
+        @ParameterizedTest(name = "{0}")
+        @ValueSource(strings = {"0", "0.0000"})
+        @DisplayName("0 % is rejected: a bet contributing 0.00 is never drawn, so the jackpot could never be won")
+        void rejectsZeroPercentage(String percentage) {
+            assertThatThrownBy(() -> policy(percentage))
+                    .isInstanceOf(JackpotConfigurationException.class)
+                    .hasMessage("percentage must be > 0 but was " + percentage
+                            + " (a 0 % contribution is never drawn, so the jackpot could never be won)");
         }
 
         @ParameterizedTest(name = "{0}")

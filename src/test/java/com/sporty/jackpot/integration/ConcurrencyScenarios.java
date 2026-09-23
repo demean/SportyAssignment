@@ -3,6 +3,7 @@ package com.sporty.jackpot.integration;
 import static com.sporty.jackpot.support.TestJackpots.fixedChance;
 import static com.sporty.jackpot.support.TestJackpots.fixedContribution;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.within;
 
 import com.sporty.jackpot.domain.model.Bet;
 import com.sporty.jackpot.domain.model.ProcessingResult;
@@ -203,7 +204,8 @@ final class ConcurrencyScenarios {
                 .allSatisfy(reward -> assertThat(reward.rewardAmount()).isEqualByComparingTo("105.00"));
         assertThat(ledger.evaluationCycles(jackpotId, "WON")).containsExactlyElementsOf(cycles);
         assertThat(rewards.count() - rewardsBefore).isEqualTo(THREADS);
-        assertThat(rewards.totalAmount() - paidBefore).isEqualTo(105.0 * THREADS);
+        // the summary is a context-wide double: exact equality would depend on what earlier scenarios paid out
+        assertThat(rewards.totalAmount() - paidBefore).isCloseTo(105.0 * THREADS, within(1e-6));
     }
 
     private void assertOneBetProcessedOn(String betId, String winner, String loser) {

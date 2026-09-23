@@ -1,4 +1,4 @@
-package com.sporty.jackpot.service;
+package com.sporty.jackpot.messaging;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.catchThrowableOfType;
@@ -11,8 +11,8 @@ import com.sporty.jackpot.config.JackpotProperties;
 import com.sporty.jackpot.domain.model.Bet;
 import com.sporty.jackpot.exception.BetPublishingException;
 import com.sporty.jackpot.exception.ErrorCode;
-import com.sporty.jackpot.messaging.BetEventMapper;
-import com.sporty.jackpot.messaging.BetPlacedEvent;
+import com.sporty.jackpot.service.BetEventPublisher;
+import com.sporty.jackpot.support.LogCapture;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.math.BigDecimal;
 import java.time.Duration;
@@ -41,8 +41,8 @@ import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.kafka.support.SendResult;
 
 @ExtendWith(MockitoExtension.class)
-@DisplayName("BetPublishingService")
-class BetPublishingServiceTest {
+@DisplayName("BetPublisher")
+class BetPublisherTest {
 
     private static final String TOPIC = "bets-under-test";
     private static final Duration PUBLISH_TIMEOUT = Duration.ofMillis(1_500);
@@ -55,19 +55,19 @@ class BetPublishingServiceTest {
     private KafkaTemplate<String, Object> kafkaTemplate;
 
     private final SimpleMeterRegistry registry = new SimpleMeterRegistry();
-    private BetPublishingService service;
+    private BetPublisher publisher;
 
     @BeforeEach
     void setUp() {
-        service = serviceWithPublishTimeout(PUBLISH_TIMEOUT);
+        publisher = publisherWithPublishTimeout(PUBLISH_TIMEOUT);
     }
 
-    private BetPublishingService serviceWithPublishTimeout(Duration publishTimeout) {
+    private BetPublisher publisherWithPublishTimeout(Duration publishTimeout) {
         JackpotProperties properties = new JackpotProperties(new JackpotProperties.Kafka(TOPIC, TOPIC + ".DLT", 12, 3,
                 (short) 1, 1, Duration.ofDays(30), publishTimeout,
                 new JackpotProperties.Consumer(new JackpotProperties.Retry(2, Duration.ofMillis(10), 2.0,
                         Duration.ofMillis(50)))));
-        return new BetPublishingService(kafkaTemplate, new BetEventMapper(), properties, registry);
+        return new BetPublisher(kafkaTemplate, new BetEventMapper(), properties, registry);
     }
 
     @AfterEach
@@ -77,7 +77,7 @@ class BetPublishingServiceTest {
     }
 
     private double published(String result) {
-        return registry.get(BetPublishingService.PUBLISHED_COUNTER).tag("result", result).counter().count();
+        return registry.get(BetPublisher.PUBLISHED_COUNTER).tag("result", result).counter().count();
     }
 
     @SuppressWarnings("unchecked")
@@ -88,7 +88,7 @@ class BetPublishingServiceTest {
     }
 
     private BetPublishingException publishFails() {
-        return catchThrowableOfType(BetPublishingException.class, () -> service.publish(BET));
+        return catchThrowableOfType(BetPublishingException.class, () -> publisher.publish(BET));
     }
 
     private void assertFailureReported(BetPublishingException exception, Throwable expectedCause) {
@@ -102,22 +102,26 @@ class BetPublishingServiceTest {
     }
 
     @Test
-    @DisplayName("success: sends the event keyed by jackpot id to the bets topic and returns placedAt")
+    @DisplayName("is the Kafka adapter of the service's BetEventPublisher port")
+    void implementsTheServicePort() {
+        assertThat(publisher).isInstanceOf(BetEventPublisher.class);
+    }
+
+    @Test
+    @DisplayName("success: sends the event keyed by jackpot id to the bets topic and waits for the acknowledgement")
     void publishesKeyedByJackpotId() throws Exception {
         CompletableFuture<SendResult<String, Object>> future = sendReturnsFutureMock();
         when(future.get(PUBLISH_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)).thenReturn(new SendResult<>(
                 new ProducerRecord<>(TOPIC, "jackpot-1", EVENT),
                 new RecordMetadata(new TopicPartition(TOPIC, 7), 42L, 0, 0L, 9, 120)));
 
-        Instant acceptedAt;
-        try (ServiceLogCapture logs = ServiceLogCapture.of(BetPublishingService.class)) {
-            acceptedAt = service.publish(BET);
+        try (LogCapture logs = LogCapture.of(BetPublisher.class)) {
+            publisher.publish(BET);
 
             assertThat(logs.messages(Level.DEBUG)).containsExactly("Published bet bet-1 to bets-under-test-7@42");
             assertThat(logs.messages(Level.WARN)).isEmpty();
         }
 
-        assertThat(acceptedAt).isEqualTo(PLACED_AT);
         verify(kafkaTemplate).send(TOPIC, "jackpot-1", EVENT);
         verify(future).get(PUBLISH_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
         assertThat(published("success")).isEqualTo(1.0);
@@ -133,7 +137,7 @@ class BetPublishingServiceTest {
                 .thenReturn(CompletableFuture.failedFuture(brokerFailure));
 
         BetPublishingException exception;
-        try (ServiceLogCapture logs = ServiceLogCapture.of(BetPublishingService.class)) {
+        try (LogCapture logs = LogCapture.of(BetPublisher.class)) {
             exception = publishFails();
 
             assertThat(logs.messages(Level.WARN)).singleElement().asString()
@@ -158,7 +162,7 @@ class BetPublishingServiceTest {
     @Test
     @DisplayName("TimeoutException from a real future that is never acknowledged")
     void neverAcknowledgedFutureTimesOut() {
-        service = serviceWithPublishTimeout(Duration.ofMillis(20));
+        publisher = publisherWithPublishTimeout(Duration.ofMillis(20));
         when(kafkaTemplate.send(TOPIC, "jackpot-1", EVENT)).thenReturn(new CompletableFuture<>());
 
         BetPublishingException exception = publishFails();

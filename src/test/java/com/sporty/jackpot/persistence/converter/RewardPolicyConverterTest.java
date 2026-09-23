@@ -8,7 +8,9 @@ import com.sporty.jackpot.domain.policy.RewardPolicy;
 import com.sporty.jackpot.domain.policy.VariableChanceRewardPolicy;
 import com.sporty.jackpot.exception.ErrorCode;
 import com.sporty.jackpot.exception.JackpotConfigurationException;
+import jakarta.persistence.Converter;
 import java.math.BigDecimal;
+import org.hibernate.annotations.Immutable;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -58,6 +60,12 @@ class RewardPolicyConverterTest {
     }
 
     @Test
+    @DisplayName("is a JPA converter marked @Immutable: policies are immutable records, never deep-copied (T20)")
+    void isAnImmutableConverter() {
+        assertThat(RewardPolicyConverter.class).hasAnnotation(Converter.class).hasAnnotation(Immutable.class);
+    }
+
+    @Test
     @DisplayName("maps null to null in both directions")
     void mapsNullToNull() {
         assertThat(converter.convertToDatabaseColumn(null)).isNull();
@@ -86,6 +94,7 @@ class RewardPolicyConverterTest {
             unknown property          | {"type":"FIXED","chancePercentage":1.0,"y":2} | "y"
             missing parameter         | {"type":"FIXED"}                              | chancePercentage must not be null
             chance above 100          | {"type":"FIXED","chancePercentage":101}       | chancePercentage must be within [0, 100] but was 101
+            extreme exponent          | {"type":"FIXED","chancePercentage":1e-999999999}  | chancePercentage must have at most 4 decimals but was 1E-999999999
             negative start chance     | {"type":"VARIABLE","startChancePercentage":-0.1,"chanceIncreasePercentage":1,"poolIncreaseStep":1,"poolLimit":10}  | startChancePercentage must be within [0, 100] but was -0.1
             negative chance increase  | {"type":"VARIABLE","startChancePercentage":1,"chanceIncreasePercentage":-1,"poolIncreaseStep":1,"poolLimit":10}    | chanceIncreasePercentage must be >= 0 but was -1
             zero pool increase step   | {"type":"VARIABLE","startChancePercentage":1,"chanceIncreasePercentage":1,"poolIncreaseStep":0,"poolLimit":10}     | poolIncreaseStep must be > 0 but was 0

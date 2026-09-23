@@ -105,6 +105,15 @@ class BetEvaluationRepositoryTest {
                 () -> evaluationRepository.saveAndFlush(evaluation(betId, jackpotId, 1)));
     }
 
+    @Test
+    @DisplayName("an evaluation needs an existing jackpot (fk_bet_evaluation_jackpot)")
+    void evaluationOfAnUnknownJackpotIsRejected() {
+        String betId = contributedBet();
+
+        assertViolates("fk_bet_evaluation_jackpot",
+                () -> evaluationRepository.saveAndFlush(evaluation(betId, uniqueId("jackpot"), 1)));
+    }
+
     @ParameterizedTest
     @ValueSource(strings = {"0.0000", "100.0000"})
     @DisplayName("win chances at the bounds 0 % and 100 % are accepted")

@@ -60,23 +60,6 @@ public final class DeadLetterReader implements AutoCloseable {
         return find(matcher).orElseThrow();
     }
 
-    /**
-     * Polls for {@code duration} and returns every received record matching {@code matcher} (use to assert that
-     * something was NOT dead-lettered).
-     */
-    public List<ConsumerRecord<String, byte[]>> pollFor(Duration duration, Predicate<ConsumerRecord<String, byte[]>> matcher) {
-        long deadline = System.nanoTime() + duration.toNanos();
-        while (System.nanoTime() < deadline) {
-            KafkaTestUtils.getRecords(consumer, POLL_TIMEOUT).forEach(received::add);
-        }
-        return received.stream().filter(matcher).toList();
-    }
-
-    /** @return every record received so far */
-    public List<ConsumerRecord<String, byte[]>> received() {
-        return List.copyOf(received);
-    }
-
     @Override
     public void close() {
         consumer.close();

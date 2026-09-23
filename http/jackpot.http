@@ -1,0 +1,157 @@
+# Jackpot Service: every endpoint, runnable from IntelliJ IDEA (HTTP Client) or VS Code (REST Client extension).
+#
+# Start the stack first: docker compose up --build   (API on :8080, actuator on :8081)
+# Host run with the default H2 profile (./mvnw spring-boot:run): the actuator is on :8080, change @managementUrl.
+#
+# Bet ids are idempotency keys: a bet id that was already processed is a no-op. To replay the walkthrough on the
+# same running stack, bump @run.
+
+@baseUrl = http://localhost:8080
+@managementUrl = http://localhost:8081
+@run = 1
+
+### Jackpots | list (pools, cycles, policies)
+GET {{baseUrl}}/api/v1/jackpots
+Accept: application/json
+
+### Jackpots | one jackpot
+GET {{baseUrl}}/api/v1/jackpots/jackpot-lucky
+Accept: application/json
+
+### Jackpots | unknown -> 404 JACKPOT_NOT_FOUND
+GET {{baseUrl}}/api/v1/jackpots/jackpot-does-not-exist
+
+### Lucky WON demo | place 250.00 on jackpot-lucky -> 202 Accepted + Location
+# On a fresh jackpot-lucky: 20 % of 250.00 = 50.00 -> pool 150.00 >= poolLimit 150 -> win chance 100 %.
+POST {{baseUrl}}/api/v1/bets
+Content-Type: application/json
+
+{
+  "betId": "http-lucky-{{run}}",
+  "userId": "user-42",
+  "jackpotId": "jackpot-lucky",
+  "betAmount": 250.00
+}
+
+### Lucky WON demo | evaluation -> WON 150.00 (404 BET_NOT_FOUND until the consumer processed the bet)
+GET {{baseUrl}}/api/v1/bets/http-lucky-{{run}}/evaluation
+
+### Lucky WON demo | contribution -> 50.00, currentJackpotAmount 150.00
+GET {{baseUrl}}/api/v1/bets/http-lucky-{{run}}/contribution
+
+### Lucky WON demo | the processed bet -> status CONTRIBUTED
+GET {{baseUrl}}/api/v1/bets/http-lucky-{{run}}
+
+### Lucky WON demo | the jackpot after the win -> pool reset to 100.00, cycle + 1
+GET {{baseUrl}}/api/v1/jackpots/jackpot-lucky
+
+### Normal bet | place 100.00 on jackpot-fixed (5 % contribution, 1 % win chance)
+POST {{baseUrl}}/api/v1/bets
+Content-Type: application/json
+
+{
+  "betId": "http-fixed-{{run}}",
+  "userId": "user-42",
+  "jackpotId": "jackpot-fixed",
+  "betAmount": 100.00
+}
+
+### Normal bet | evaluation (LOST in 99 % of the runs)
+GET {{baseUrl}}/api/v1/bets/http-fixed-{{run}}/evaluation
+
+### Normal bet | contribution -> 5.00
+GET {{baseUrl}}/api/v1/bets/http-fixed-{{run}}/contribution
+
+### Normal bet | same bet id again -> 202, but the consumer ignores it (DUPLICATE); the pool does not change
+POST {{baseUrl}}/api/v1/bets
+Content-Type: application/json
+
+{
+  "betId": "http-fixed-{{run}}",
+  "userId": "user-42",
+  "jackpotId": "jackpot-fixed",
+  "betAmount": 100.00
+}
+
+### Unknown jackpot | place a bet (the API does not check the jackpot, the consumer does)
+POST {{baseUrl}}/api/v1/bets
+Content-Type: application/json
+
+{
+  "betId": "http-unknown-{{run}}",
+  "userId": "user-42",
+  "jackpotId": "jackpot-does-not-exist",
+  "betAmount": 10.00
+}
+
+### Unknown jackpot | the bet -> 200, status NO_MATCHING_JACKPOT
+GET {{baseUrl}}/api/v1/bets/http-unknown-{{run}}
+
+### Unknown jackpot | evaluation -> 422 BET_NOT_CONTRIBUTING
+GET {{baseUrl}}/api/v1/bets/http-unknown-{{run}}/evaluation
+
+### Unknown jackpot | contribution -> 422 BET_NOT_CONTRIBUTING
+GET {{baseUrl}}/api/v1/bets/http-unknown-{{run}}/contribution
+
+### Errors | 400 VALIDATION_FAILED (errors sorted by field, then message)
+POST {{baseUrl}}/api/v1/bets
+Content-Type: application/json
+
+{
+  "betId": "",
+  "userId": "user 42",
+  "jackpotId": "jackpot-fixed",
+  "betAmount": 0.001
+}
+
+### Errors | 400 MALFORMED_REQUEST (body is not a valid PlaceBetRequest)
+POST {{baseUrl}}/api/v1/bets
+Content-Type: application/json
+
+{ "betId": "http-bad-{{run}}", "betAmount": "lots" }
+
+### Errors | 400 MALFORMED_REQUEST (strict parsing: a duplicate key is never last-wins)
+POST {{baseUrl}}/api/v1/bets
+Content-Type: application/json
+
+{ "betId": "http-dup-{{run}}", "userId": "user-42", "jackpotId": "jackpot-fixed", "betAmount": 1.00, "betAmount": 999.00 }
+
+### Errors | 400 VALIDATION_FAILED on a path variable (ids must match ^(?!\.{1,2}$)[A-Za-z0-9._:-]{1,64}$)
+GET {{baseUrl}}/api/v1/bets/bad!id
+
+### Errors | 404 BET_NOT_FOUND (unknown, or not consumed yet)
+GET {{baseUrl}}/api/v1/bets/never-placed-{{run}}
+
+### Errors | 404 RESOURCE_NOT_FOUND (unknown URL)
+GET {{baseUrl}}/api/v1/nothing-here
+
+### Errors | 405 METHOD_NOT_ALLOWED (+ Allow: GET)
+DELETE {{baseUrl}}/api/v1/jackpots/jackpot-fixed
+
+### Errors | 406 NOT_ACCEPTABLE (rejected before the handler runs, so nothing is published)
+GET {{baseUrl}}/api/v1/jackpots
+Accept: application/xml
+
+### Errors | 415 UNSUPPORTED_MEDIA_TYPE
+POST {{baseUrl}}/api/v1/bets
+Content-Type: text/plain
+
+hello
+
+### Docs | OpenAPI 3.1 document (Swagger UI: http://localhost:8080/swagger-ui.html)
+GET {{baseUrl}}/v3/api-docs
+
+### Ops | health with details (db, kafkaListeners, diskSpace, ...)
+GET {{managementUrl}}/actuator/health
+
+### Ops | liveness probe
+GET {{managementUrl}}/actuator/health/liveness
+
+### Ops | readiness probe
+GET {{managementUrl}}/actuator/health/readiness
+
+### Ops | Prometheus scrape (business metrics start with jackpot_)
+GET {{managementUrl}}/actuator/prometheus
+
+### Ops | one metric
+GET {{managementUrl}}/actuator/metrics/jackpot.bets.processed

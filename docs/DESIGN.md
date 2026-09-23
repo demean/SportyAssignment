@@ -67,10 +67,10 @@ when a technical constraint forces it, and record the deviation in §12 of this 
 | T5 | Front-running / waiting-game (watch the pool, evaluate later) | Impossible: the draw happens atomically with the contribution in Kafka order. |
 | T6 | Double payout | One transaction per bet under the jackpot lock; reward resets the pool and bumps `cycle`; DB backstop `UNIQUE(jackpot_id, pool_cycle)` on `jackpot_reward` and `UNIQUE(bet_id)`. |
 | T7 | Reset | Pool := initial, cycle++ in the same transaction as the reward + evaluation inserts. |
-| T8 | Formula edge cases | Variable contribution floored at `minPercentage`; chance capped at 100; pool growth below initial clamped to 0; parameters validated in record constructors; cross-field `poolLimit > initialPool` validated at startup (fail fast). |
-| T9 | Async flow / eventual consistency | `POST /bets` → `202 Accepted` + `Location: /api/v1/bets/{betId}`. Clients poll `GET /bets/{betId}`: `404 BET_NOT_FOUND` = not processed (yet); `422 BET_NOT_CONTRIBUTING` = processed, no matching jackpot. |
+| T8 | Formula edge cases | Variable contribution floored at `minPercentage`; chance capped at 100; pool growth below initial clamped to 0; parameters validated in record constructors (percentages at most 4 decimals; contribution percentages > 0, because a 0 % contribution is never drawn and would freeze the jackpot, §12 item 12); cross-field `poolLimit > initialPool` validated at startup, before the consumers start (fail fast), and again for every bet (§12 item 11). |
+| T9 | Async flow / eventual consistency | `POST /bets` → `202 Accepted` + `Location: /api/v1/bets/{betId}`. Clients poll `GET /bets/{betId}`: `404 BET_NOT_FOUND` = not processed (yet); `422 BET_NOT_CONTRIBUTING` = processed, no matching jackpot (decided from the bet row, read first: §6.3). |
 | T10 | Bet for unknown jackpot | Stored as `NO_MATCHING_JACKPOT`, metric, WARN, acked (not DLT). |
-| T11 | Poison pills vs transient failures | `ErrorHandlingDeserializer` (+ `checkDeserExWhenKeyNull/ValueNull`); deterministic failures (`DeserializationException`, `InvalidBetException`, `JackpotConfigurationException`, non-duplicate `DataIntegrityViolationException`) → DLT immediately; **transient** DB/Kafka failures → retried **indefinitely** with exponential back-off (partition blocks, order preserved, no money event lost); unknown exceptions → bounded retries then DLT. |
+| T11 | Poison pills vs transient failures | `ErrorHandlingDeserializer` (+ `checkDeserExWhenKeyNull/ValueNull`) around a strict JSON delegate (duplicate keys and strings coerced into numbers fail, as in the API: §12 item 12); deterministic failures (`DeserializationException`, `InvalidBetException`, `JackpotConfigurationException`, non-duplicate `DataIntegrityViolationException`) → DLT immediately; **transient** DB/Kafka failures → retried **indefinitely** with exponential back-off (the consumer thread waits, and with it every partition assigned to it; order preserved, no money event lost); unknown exceptions → bounded retries then DLT. |
 | T12 | Predictable randomness | `SecureRandom` as `RandomGenerator` bean; exact integer draw `nextLong(1_000_000) < chance×10_000`. |
 | T13 | Publish reliability | `acks=all`, `enable.idempotence=true`; API waits for the broker ack; timeouts ordered `publish-timeout ≥ max.block.ms + delivery.timeout.ms + 1s` (validated at startup); `503 BET_PUBLISH_FAILED` says "outcome unknown — retry with the same betId". |
 | T14 | Ordering / hot rows | Record key = `jackpotId` → per-jackpot ordering and single consumer writer per jackpot; 12 partitions (seeded ids land on distinct partitions). |
@@ -79,7 +79,7 @@ when a technical constraint forces it, and record the deviation in §12 of this 
 | T17 | Lock waits | Single lock timeout: H2 `LOCK_TIMEOUT=3000` in URL; PostgreSQL Hikari `connection-init-sql: SET lock_timeout = '3s'`; no JPA lock-timeout query hint (ignored by H2, costly on PG). Hikari `connection-timeout: 2s`. |
 | T18 | Metrics/logs claiming things that rolled back | Business metrics and "processed/won" logs are emitted from a `@TransactionalEventListener(phase = AFTER_COMMIT)`. |
 | T19 | Hibernate insert ordering with plain FK columns | `saveAndFlush` in FK order (bet → contribution → reward → evaluation); `order_inserts` not enabled. |
-| T20 | Converted policy attributes deep-copied on every load | Policy converters annotated `@org.hibernate.annotations.Immutable` (policy records are immutable). |
+| T20 | Converted policy attributes deep-copied on every load | Policy converters annotated `@org.hibernate.annotations.Immutable` (policy records are immutable); the converter tests assert the annotation. |
 | T21 | Virtual-thread pinning on JDK 21 in Kafka poll loops | HTTP on virtual threads; Kafka listener containers on platform threads (`SimpleAsyncTaskExecutor` with virtual threads off) via `ContainerCustomizer`. |
 | T22 | H2 profile + multiple instances | H2 = single instance only (WARN at startup); horizontal scaling = postgres profile; different default consumer groups per profile. |
 
@@ -125,18 +125,21 @@ com.sporty.jackpot
 │   ├── BetPublishingException                // carries betId
 │   └── JackpotConfigurationException
 ├── service
-│   ├── BetPublishingService                  // Bet -> Kafka (no DB)
+│   ├── BetPlacementService                   // place-bet use case: Bet stamped with the clock -> BetEventPublisher (no DB)
+│   ├── BetEventPublisher                     // outbound port, implemented by messaging.BetPublisher
 │   ├── BetProcessingService                  // @Transactional process(Bet): contribution + evaluation
 │   ├── BetQueryService                       // @Transactional(readOnly = true)
 │   ├── JackpotQueryService                   // @Transactional(readOnly = true)
-│   ├── JackpotConfigurationValidator         // ApplicationRunner: cross-field validation, fail fast; H2 single-instance WARN
+│   ├── JackpotConfigurationValidator         // SmartInitializingSingleton: cross-field validation, fail fast; H2 WARN
 │   ├── RewardDraw                            // @Component
 │   └── event
 │       ├── BetProcessedEvent                 // record published inside the tx
 │       └── BetProcessingMetrics              // @TransactionalEventListener(AFTER_COMMIT): metrics + INFO log
 ├── messaging
 │   ├── BetPlacedEvent                        // Kafka payload DTO
+│   ├── BetPlacedEventDeserializer            // consumer value delegate: strict JSON (duplicate keys, no coercion)
 │   ├── BetEventMapper                        // Bet <-> BetPlacedEvent
+│   ├── BetPublisher                          // Bet -> Kafka (no DB): producer adapter implementing service.BetEventPublisher
 │   ├── BetEventListener                      // @KafkaListener (NOT @Transactional)
 │   └── KafkaListenersHealthIndicator         // DOWN if a listener container is not running
 ├── persistence
@@ -149,16 +152,23 @@ com.sporty.jackpot
     ├── dto         PlaceBetRequest, BetAcceptedResponse, BetResponse, ContributionResponse, BetEvaluationResponse,
     │               JackpotResponse, PolicyResponse
     ├── mapper      ApiMapper
-    └── error       GlobalExceptionHandler, ErrorHttpStatus (ErrorCode -> HttpStatus, exhaustive switch)
+    └── error       GlobalExceptionHandler, ErrorHttpStatus (ErrorCode -> HttpStatus, exhaustive switch),
+                    ProblemDetailOpenApiCustomizer (documents every 4xx/5xx as application/problem+json)
 ```
 
 Layer rules (ArchUnit test `ArchitectureTest`, all must hold):
 1. `domain..` and `exception..` depend on no `org.springframework..`, `jakarta.persistence..`, `org.hibernate..`, `tools.jackson..`, `com.fasterxml..`.
 2. `api..` and `messaging..` do not depend on `persistence..`.
-3. Public methods of `@RestController` classes take/return only `api.dto..` types, `String`, primitives, `ResponseEntity`, `List` (of DTOs).
+3. Public methods of controller classes (meta-annotated `@Controller`) take/return only `api.dto..` types, `String`, primitives, `ResponseEntity`, `List` (of DTOs).
+   Controllers map the domain objects the services return to DTOs through `ApiMapper`.
 4. `persistence.entity..` classes are only accessed from `persistence..` and `service..`.
-5. `@Transactional` is only used in `service..` (no `@Transactional` on listeners/controllers).
+5. `@Transactional` is only used in `service..` (no `@Transactional` on listeners/controllers); every public method of a
+   service class owning a repository is transactional (method or class), and read-write ones pin `READ_COMMITTED`.
 6. No field injection (`@Autowired` fields) in main code.
+7. Layers: `api` → `service`, `domain`, `exception` (never another adapter); `messaging` → `service`, `domain`, `exception`, `config`
+   (properties); `service` → `persistence`, `domain`, `exception`; `persistence` → `domain`, `exception`; `domain` →
+   `exception`; `exception` → nothing. `config` is the composition root and may use anything. No package cycles
+   (ignoring dependencies from `config`).
 
 Other rules: no Lombok; records for DTOs/value objects; constructor injection; exhaustive pattern-matching `switch`
 without `default` over sealed policy hierarchies (a new policy fails compilation until mapped).
@@ -185,9 +195,11 @@ public final class Money {
 
 ### 4.2 `Bet`
 `record Bet(String betId, String userId, String jackpotId, BigDecimal amount, Instant placedAt)`;
-`public static final String ID_REGEX = "^[A-Za-z0-9._:-]{1,64}$"`; `MAX_AMOUNT = 1_000_000_000.00`.
+`public static final String ID_REGEX = "^(?!\\.{1,2}$)[A-Za-z0-9._:-]{1,64}$"` (§12 item 11: `.` and `..` are URL dot
+segments); `MAX_AMOUNT = 1_000_000_000.00`.
 Compact constructor → `InvalidBetException` when an id is null/blank/not matching, amount null / ≤ 0 / scale > 2 (after
-`stripTrailingZeros`) / > MAX_AMOUNT, or `placedAt` null. Amount stored normalized to scale 2.
+`stripTrailingZeros`) / > MAX_AMOUNT, or `placedAt` null. Amount stored normalized to scale 2. Messages quote untrusted
+input bounded: an id cut to 80 characters (plus its length), an amount with `BigDecimal.toString()`.
 
 ### 4.3 Contribution policies
 ```java
@@ -200,13 +212,15 @@ public sealed interface ContributionPolicy permits FixedContributionPolicy, Vari
     /** Cross-field validation against the jackpot's initial pool; throws JackpotConfigurationException. */
     default void validateFor(BigDecimal initialPool) { }
 }
-record FixedContributionPolicy(BigDecimal percentage)                       // 0 ≤ p ≤ 100
+record FixedContributionPolicy(BigDecimal percentage)                       // 0 < p ≤ 100
 record VariableContributionPolicy(BigDecimal startPercentage, BigDecimal minPercentage,
                                   BigDecimal decayPercentage, BigDecimal poolIncreaseStep)
-// 0 ≤ min ≤ start ≤ 100; decay ≥ 0; step > 0
+// 0 < min ≤ start ≤ 100; decay ≥ 0; step > 0
 // pct = max(min, start − decay × max(0, pool − initial) / step)   (MathContext.DECIMAL64) → normalizePercentage
 ```
 Constructor violations → `JackpotConfigurationException` (non-retryable); nulls → same exception with the parameter name.
+A contribution percentage of 0 is rejected: a bet contributing 0.00 is never drawn (§1.3), so such a jackpot could never
+grow or be won again (§12 item 12). Rejected values are quoted with `BigDecimal.toString()` (bounded, §12 item 12).
 
 ### 4.4 Reward policies
 ```java
@@ -391,11 +405,15 @@ Test: every `getPermittedSubclasses()` of both sealed interfaces has a registere
 
 ## 6. Services
 
-### 6.1 `BetPublishingService` (no DB)
-`public Instant publish(Bet bet)` — `BetEventMapper.toEvent(bet)`; `kafkaTemplate.send(betsTopic, bet.jackpotId(), event).get(publishTimeout)`;
-`ExecutionException` / `TimeoutException` / `KafkaException` → `BetPublishingException(betId, cause)`; `InterruptedException` → restore
-the interrupt flag + `BetPublishingException`. Counter `jackpot.bets.published{result=success|failure}`. Returns `bet.placedAt()`.
-The controller builds `Bet` with `placedAt = clock.instant()`.
+### 6.1 `service.BetPlacementService` + port `service.BetEventPublisher` → `messaging.BetPublisher` (no DB; §12 items 11, 12)
+`BetPlacementService.place(String betId, String userId, String jackpotId, BigDecimal amount)` builds
+`new Bet(…, clock.instant())` (domain invariants → `InvalidBetException`, nothing published), calls
+`BetEventPublisher.publish(bet)` and returns the bet (its `placedAt` is the `acceptedAt` of the 202). It owns no repository
+and is not transactional. The controller calls only this service.
+`messaging.BetPublisher implements BetEventPublisher`: `public void publish(Bet bet)` — `BetEventMapper.toEvent(bet)`;
+`kafkaTemplate.send(betsTopic, bet.jackpotId(), event).get(publishTimeout)`; `ExecutionException` / `TimeoutException` /
+`KafkaException` → `BetPublishingException(betId, cause)`; `InterruptedException` → restore the interrupt flag +
+`BetPublishingException`. Counter `jackpot.bets.published{result=success|failure}`.
 
 ### 6.2 `BetProcessingService`
 ```java
@@ -406,7 +424,9 @@ The controller builds `Bet` with `placedAt = clock.instant()`.
 1. `jackpot = jackpotRepository.findByIdForUpdate(bet.jackpotId())` (row lock).
 2. `betRepository.findById(bet.betId())` present → WARN if payload differs (userId, jackpotId, amount via compareTo) → `ProcessingResult.duplicate`. No draw.
 3. Jackpot absent → `betRepository.saveAndFlush(BetEntity(…, NO_MATCHING_JACKPOT, placedAt, now))`, publish `BetProcessedEvent`, return `noMatchingJackpot`.
-4. `amount = policy.contributionAmount(stake, poolBefore, initial)`; `poolAfter = jackpot.addContribution(amount, now)`; `cycle = jackpot.getCycle()`.
+4. Both policies' `validateFor(initial)` (the startup check does not cover a jackpot changed while running;
+   `JackpotConfigurationException` → rollback → DLT), then `amount = policy.contributionAmount(stake, poolBefore, initial)`;
+   `poolAfter = jackpot.addContribution(amount, now)`; `cycle = jackpot.getCycle()`.
 5. `saveAndFlush` bet (CONTRIBUTED) then contribution (`currentJackpotAmount = poolAfter`, `poolCycle = cycle`).
 6. `amount > 0` ? `chance = rewardPolicy.winChancePercentage(poolAfter, initial)`, `won = rewardDraw.isWinning(chance)` : `chance = 0.0000`, `won = false`.
 7. WON → `reward = jackpot.award(now)`; `saveAndFlush(JackpotRewardEntity(…, reward, cycle, now))`. LOST → reward 0.00.
@@ -415,16 +435,18 @@ The controller builds `Bet` with `placedAt = clock.instant()`.
 
 ### 6.3 `BetQueryService` — class-level `@Transactional(readOnly = true)`
 `ProcessedBet getBet(String betId)` → `BetNotFoundException`.
-`Contribution getContribution(String betId)` / `BetEvaluation getEvaluation(String betId)`:
-`repo.findByBetId(betId).map(mapper).orElseThrow(() -> missing(betId))` where `missing` = `BetNotContributingException` if the bet
-exists, else `BetNotFoundException`.
+`Contribution getContribution(String betId)` / `BetEvaluation getEvaluation(String betId)`: the bet row is read FIRST —
+absent → `BetNotFoundException`, `NO_MATCHING_JACKPOT` → `BetNotContributingException`, `CONTRIBUTED` → the child row,
+which was committed in the same transaction (missing = broken invariant, `IllegalStateException`). §12 item 11.
 
 ### 6.4 `JackpotQueryService` — class-level `@Transactional(readOnly = true)`
 `List<Jackpot> findAll()` (`Sort.by("id")`), `Jackpot getJackpot(String id)` → `JackpotNotFoundException`.
 
-### 6.5 `JackpotConfigurationValidator implements ApplicationRunner`
+### 6.5 `JackpotConfigurationValidator implements SmartInitializingSingleton` (§12 item 11)
 Loads all jackpots via `JackpotQueryService`, calls `contributionPolicy.validateFor(initial)` and `rewardPolicy.validateFor(initial)` → throws
-(startup fails) on misconfiguration. Logs a WARN when the datasource URL starts with `jdbc:h2:mem:` ("volatile, single-instance only").
+(startup fails) on misconfiguration, before the lifecycle beans (Kafka listener containers, web server) start. The same
+static check runs in `BetProcessingService` for every bet. Logs a WARN when the datasource URL starts with `jdbc:h2:mem:`
+("volatile, single-instance only").
 
 ### 6.6 `RewardDraw`
 `boolean isWinning(BigDecimal chancePercentage)`: reject < 0 or > 100 (`IllegalArgumentException`);
@@ -435,7 +457,8 @@ Loads all jackpots via `JackpotQueryService`, calls `contributionPolicy.validate
 BigDecimal contributionAmount /*nullable*/, BigDecimal rewardAmount /*nullable*/, Instant placedAt, Instant processedAt)`.
 `BetProcessingMetrics.onProcessed` (`@TransactionalEventListener(phase = AFTER_COMMIT)`): counters
 `jackpot.bets.processed{status}`, `jackpot.evaluations{outcome}` (PROCESSED only), `jackpot.rewards.amount` (DistributionSummary, WON only),
-timer `jackpot.bets.processing.latency` (processedAt − placedAt), INFO log.
+INFO/WARN log, then timer `jackpot.bets.processing.latency` (processedAt − placedAt). `placedAt` is producer-supplied, so a
+span that is negative or longer than 30 days (the DLT retention) is not recorded (§12 item 12).
 
 ---
 
@@ -446,7 +469,8 @@ timer `jackpot.bets.processing.latency` (processedAt − placedAt), INFO log.
 - Keep Boot's auto-configured producer/consumer/container factories. Producer value serializer is set through a
   `DefaultKafkaProducerFactoryCustomizer` → `DelegatingByTypeSerializer({byte[] → ByteArraySerializer, BetPlacedEvent → Jackson 3 JSON serializer (no type headers)}, assignable=true)`.
   The same customizer validates `publish-timeout ≥ max.block.ms + delivery.timeout.ms + 1s` (fail fast).
-- Consumer via YAML: `ErrorHandlingDeserializer` → Jackson 3 JSON deserializer delegate, default type `BetPlacedEvent`,
+- Consumer via YAML: `ErrorHandlingDeserializer` → Jackson 3 JSON deserializer delegate `messaging.BetPlacedEventDeserializer`
+  (strict like the API: duplicate keys and string-to-number coercion fail, §12 item 12), default type `BetPlacedEvent`,
   `spring.json.use.type.headers=false`, trusted package `com.sporty.jackpot.messaging`, unknown JSON properties ignored,
   `CooperativeStickyAssignor`, `max.poll.records=50`, `max.poll.interval.ms=300000`, `auto-offset-reset=earliest`.
 - `ContainerCustomizer`: platform-thread `listenerTaskExecutor`, `shutdownTimeout=15s`, `checkDeserExWhenKeyNull/ValueNull=true`.
@@ -459,8 +483,11 @@ timer `jackpot.bets.processing.latency` (processedAt − placedAt), INFO log.
     cause chain contains `TransientDataAccessException`, `RecoverableDataAccessException`, `CannotCreateTransactionException`,
     `DataAccessResourceFailureException`, `java.sql.SQLTransientException`, `org.apache.kafka.common.errors.RetriableException`.
   - recoverer = counter `jackpot.bets.dead-lettered{exception}` + `DeadLetterPublishingRecoverer` with resolver → `(deadLetterTopic, -1)`.
+    A dead-letter record too large to publish (`RecordTooLargeException`) is logged, counted as
+    `jackpot.bets.dead-letter-failed{exception}` and acknowledged instead of being retried forever (§12 item 11).
 - `KafkaListenersHealthIndicator` (`HealthIndicator`): UP when every container in `KafkaListenerEndpointRegistry` is running
-  (or auto-startup is disabled), DOWN otherwise, with container ids in details.
+  (or auto-startup is disabled, or the registry itself is not running: startup/shutdown), DOWN otherwise, with container
+  ids in details. Member of the liveness group.
 
 ---
 
@@ -529,7 +556,7 @@ spring:
   threads.virtual.enabled: true
   lifecycle.timeout-per-shutdown-phase: 20s
   datasource:
-    url: jdbc:h2:mem:jackpot;MODE=PostgreSQL;DATABASE_TO_LOWER=TRUE;DEFAULT_NULL_ORDERING=HIGH;DB_CLOSE_DELAY=-1;LOCK_TIMEOUT=3000
+    url: jdbc:h2:mem:${jackpot.h2.database:jackpot};MODE=PostgreSQL;DATABASE_TO_LOWER=TRUE;DEFAULT_NULL_ORDERING=HIGH;DB_CLOSE_DELAY=-1;LOCK_TIMEOUT=3000
     username: sa
     password: ""
     hikari: { maximum-pool-size: 10, minimum-idle: 2, connection-timeout: 2000, pool-name: jackpot-hikari }
@@ -537,6 +564,7 @@ spring:
     open-in-view: false
     hibernate.ddl-auto: validate
     properties.hibernate: { jdbc.time_zone: UTC, jdbc.batch_size: 50 }
+  jackson: { read.strict-duplicate-detection: true, mapper.allow-coercion-of-scalars: false }
   flyway:
     locations: classpath:db/migration
     placeholders:
@@ -559,7 +587,7 @@ spring:
 server.shutdown: graceful
 management:
   endpoints.web.exposure.include: health,info,metrics,prometheus
-  endpoint.health: { probes.enabled: true, show-details: always }
+  endpoint.health: { probes.enabled: true, show-details: always, group.liveness.include: "livenessState,kafkaListeners" }
 jackpot:
   kafka:
     bets-topic: jackpot-bets
@@ -585,15 +613,15 @@ jackpot:
 
 ## 10. Build, run, test
 
-- Maven wrapper 3.3.4 (`mvn -N wrapper:wrapper -Dmaven=3.9.9`), Boot parent 4.1.1, Java 21
-  (local `JAVA_HOME=/Library/Java/JavaVirtualMachines/amazon-corretto-21.jdk/Contents/Home`).
+- Maven wrapper 3.3.4 (`mvn -N wrapper:wrapper -Dmaven=3.9.9`), Boot parent 4.1.1, Java 21 (`$JAVA_HOME` pointing to a
+  JDK 21).
 - Dependencies/APIs: see §13 (verified by the probe project).
 - JaCoCo: `check` in `verify`, BUNDLE rules INSTRUCTION/BRANCH/LINE/METHOD/CLASS/COMPLEXITY = 1.00, **no excludes**.
 - Surefire: `**/*Test.java` (H2 + Embedded Kafka, no Docker). Failsafe: `**/*IT.java` only with `-Pit` (Testcontainers PostgreSQL + Kafka).
 - `Dockerfile`: multi-stage (`maven:3.9-eclipse-temurin-21` → `eclipse-temurin:21-jre`), non-root, Boot layered jar extraction
   (`java -Djarmode=tools -jar app.jar extract --layers --launcher`), `-XX:MaxRAMPercentage=75`, exec-form `ENTRYPOINT`,
-  `HEALTHCHECK` on the management port. **No BuildKit-only syntax** (`RUN --mount`, `# syntax=`): the local Docker CLI has no
-  buildx and BuildKit fails on this machine; the file must build with the legacy builder (`DOCKER_BUILDKIT=0`).
+  `HEALTHCHECK` on the management port. **No BuildKit-only syntax** (`RUN --mount`, `# syntax=`): the file must build with
+  the legacy builder (`DOCKER_BUILDKIT=0`) on Docker CLIs without buildx.
   `.dockerignore` excludes `target/`, `.git/`, IDE files.
 - `docker-compose.yml` (`docker compose up --build` runs everything):
   - `kafka`: `apache/kafka:4.2.1` (matches kafka-clients 4.2.1), env `KAFKA_NODE_ID=1`, `KAFKA_PROCESS_ROLES=broker,controller`,
@@ -605,14 +633,18 @@ jackpot:
     `KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS=0`, `KAFKA_AUTO_CREATE_TOPICS_ENABLE=false`; port 9092; healthcheck
     `kafka-broker-api-versions.sh --bootstrap-server kafka:29092`.
   - `postgres`: `postgres:17-alpine`, db/user/password `jackpot`, `command: postgres -c max_connections=200`, `pg_isready` healthcheck, port 5432.
+  - Named volumes `postgres-data` (`/var/lib/postgresql/data`) and `kafka-data` (`/var/lib/kafka/data`, with
+    `KAFKA_LOG_DIRS` pointing there): `docker compose down` keeps the data, `down -v` deletes it. The Kafka image's
+    other, unused volumes (`/etc/kafka/secrets`, `/mnt/shared/config`) are `tmpfs` mounts, so no `down` leaves
+    anonymous volumes behind (§12 item 12).
   - `kafka-ui`: `kafbat/kafka-ui:v1.5.0` → `kafka:29092`, port 8090.
   - `jackpot-service`: build `.`, `SPRING_PROFILES_ACTIVE=postgres`, `KAFKA_BOOTSTRAP_SERVERS=kafka:29092`,
     `POSTGRES_URL=jdbc:postgresql://postgres:5432/jackpot`, ports 8080 + 8081, `depends_on: condition: service_healthy`, `stop_grace_period: 30s`.
 
 ### 10.1 Test plan (all required)
 - Test config in `src/test/resources/config/application.yml` (classpath:/config/ overrides classpath:/application.yml for **every**
-  test context, no profile needed): `spring.datasource.url: jdbc:h2:mem:test-${random.uuid};MODE=PostgreSQL;DATABASE_TO_LOWER=TRUE;DEFAULT_NULL_ORDERING=HIGH;DB_CLOSE_DELAY=-1;LOCK_TIMEOUT=3000`
-  (one DB per context), retry intervals 10–50 ms, `spring.kafka.listener.auto-startup: false` by default (the Embedded-Kafka
+  test context, no profile needed): `jackpot.h2.database: test-${random.uuid}` (one DB per context; the rest of the shipped
+  H2 URL is kept, §12 item 11), retry intervals 10–50 ms, `spring.kafka.listener.auto-startup: false` by default (the Embedded-Kafka
   base class turns it on), quiet Kafka/embedded-broker loggers (`kafka`, `org.apache.kafka`, `org.apache.zookeeper` → WARN;
   `kafka.server.ReplicaManager`, `org.apache.kafka.storage.internals.log.LogDirFailureChannel` → OFF).
   Tests create their own jackpots with unique ids (JdbcTemplate/repository); seeds are only asserted read-only.
@@ -686,7 +718,8 @@ _(implementation notes any forced deviation here)_
 7. **Docker** (§10): the image sets `ENV MANAGEMENT_SERVER_PORT=8081` so the `HEALTHCHECK`
    (`/actuator/health/readiness`) hits the same port under every profile; the build stage uses the base image's `mvn`.
    In `docker-compose.yml` the PostgreSQL host port is `${POSTGRES_HOST_PORT:-5432}` (a host PostgreSQL already
-   listens on 5432 on the dev machine), and `jackpot-service` also declares a compose-level healthcheck.
+   listens on 5432 on the dev machine), and `jackpot-service` also declares a compose-level healthcheck. PostgreSQL and
+   Kafka keep their data in named volumes (item 12).
 8. **Production fixes found by the test suites** (integration pass):
    - **Policy converters** (§5.4): the JSON literal `null` (valid JSON, and not rejected by the `NOT NULL` column) is
      rejected with `JackpotConfigurationException("Invalid contribution|reward policy JSON: null")` (no cause) instead
@@ -700,7 +733,8 @@ _(implementation notes any forced deviation here)_
      `application/problem+json`.
    - **`jackpot.bets.dead-lettered`** (§7): the counting recoverer logs before delegating but counts only after the
      `DeadLetterPublishingRecoverer` has published the record. A failed DLT publication propagates (the record is
-     re-seeked) and is not counted, so the metric cannot climb for records that were never dead-lettered.
+     re-seeked) and is not counted, so the metric cannot climb for records that were never dead-lettered. Exception: a
+     dead-letter record too large to publish (item 11).
    - **`application.yml`** (§9): `springdoc.api-docs.enabled: true` and `springdoc.swagger-ui.enabled: true` are set
      explicitly. Both endpoints are part of the contract; springdoc only enables them by default and logs a WARN at
      every startup when they are left implicit.
@@ -735,12 +769,86 @@ _(implementation notes any forced deviation here)_
     - `ArchitectureTest` uses plain JUnit tests over `ClassFileImporter` with `ImportOption.DoNotIncludeTests` (not the
       ArchUnit JUnit engine), so rule 6 does not flag `@Autowired` fields in test classes.
 
+11. **Review round 1** (fixes of confirmed findings):
+    - **Bounded error messages** (§4.2): `Bet` quoted a rejected amount with `toPlainString()`. An 11-byte JSON amount
+      such as `1e999999999` has a plain form of a billion digits: the consumer thread died with an `OutOfMemoryError`,
+      the container stopped every consumer and the record was never committed. Amounts are now quoted with
+      `toString()` (scientific notation for extreme exponents), and a rejected id is quoted cut to 80 characters plus
+      its length. The counting recoverer cuts the logged key and failure to 500 characters.
+    - **Oversized dead-letter records** (§7): the dead-letter copy of a record adds exception headers and can exceed
+      the producer's `max.request.size` (1 MiB). That failure is deterministic, and re-seeking the record retried it
+      forever with no back-off, blocking the consumer thread. A `RecordTooLargeException` is now logged once with the
+      record's coordinates, counted as `jackpot.bets.dead-letter-failed{exception}` and acknowledged (the original
+      stays in `jackpot-bets` for a replay within its retention). `KafkaConfig.DeadLetterPublisher` overrides
+      `DeadLetterPublishingRecoverer.publish` because the base class drops the cause of a send that fails
+      synchronously (the producer rejects an oversized record before sending it).
+    - **Lookups race the commit** (§6.3, T9): `getContribution`/`getEvaluation` read the child table first and, on a
+      miss, checked whether the bet row existed. Each READ_COMMITTED statement has its own snapshot, so a commit
+      between the two statements answered the terminal `422 BET_NOT_CONTRIBUTING` for a contributing (possibly
+      winning) bet. The bet row is now read first and its status decides 404 / 422.
+    - **Jackpot configuration check** (§6.2, §6.5, T8): the `ApplicationRunner` ran after the context refresh, when the
+      Kafka listener containers were already consuming, and it never protected running instances (e.g. a migration of
+      a rolling deploy on the shared PostgreSQL). With `poolLimit <= initialPool` every contributing bet wins the whole
+      pool. The validator is now a `SmartInitializingSingleton` (runs before any lifecycle bean starts), and
+      `BetProcessingService` repeats the check for every bet, under the lock and before any write
+      (`JackpotConfigurationException` → rollback → DLT).
+    - **Package structure** (§3): the Kafka producer adapter moved from `service.BetPublishingService` to
+      `messaging.BetPublisher`. It used `messaging.BetEventMapper` and `config.JackpotProperties`, while
+      `messaging.BetEventListener` uses `service`: two package cycles. ArchUnit now checks the layer dependencies and
+      the absence of cycles (rule 7), controllers by `@Controller` meta-annotation, and that every public method of a
+      repository-owning service is transactional with `READ_COMMITTED` writes (rule 5).
+    - **Liveness** (§7, §9): `kafkaListeners` joins the liveness group, so an orchestrator restarts an instance whose
+      consumers stopped (fatal listener error). Readiness keeps its default: the HTTP API still works. The indicator
+      reports UP while the registry itself is stopped (graceful shutdown). The Docker/compose healthchecks still poll
+      readiness (Docker does not restart unhealthy containers).
+    - **API**: ids `.` and `..` are rejected (URL dot segments: `Location: /api/v1/bets/..` resolves elsewhere);
+      request bodies are parsed strictly (duplicate keys and string-to-number coercion → `400 MALFORMED_REQUEST`);
+      OpenAPI documents every 4xx/5xx as `application/problem+json` with a `Problem` schema (`api.error.
+      ProblemDetailOpenApiCustomizer`, which also adds `Retry-After` to every 503), plus `Location` on 202, 400 on the
+      id lookups, 415 on POST and 503 `TEMPORARILY_UNAVAILABLE` on the lookups.
+    - **Percentages** (§4.3): policy percentages have at most 4 decimals (the precision of the formulas and of the
+      draw); a finer value was displayed as configured but silently rounded when used.
+    - **Tests run the shipped H2 settings** (§9, §10.1): the test configuration overrode the whole H2 URL, so the
+      shipped `MODE`/`LOCK_TIMEOUT` were never exercised. The URL now takes the database name from
+      `jackpot.h2.database` (default `jackpot`), and the tests only set that name.
+    - **Docker**: the image build skips test compilation (`-Dmaven.test.skip=true`).
+
+12. **Review round 2** (fixes of confirmed findings):
+    - **Place-bet use case in a service** (§3, §6.1): after round 1 moved the producer to `messaging`, `BetController`
+      stamped the bet with its own `Clock` and called the Kafka adapter directly (`api` → `messaging`), so the only
+      write use case had no service and a second entry point would have duplicated it. `service.BetPlacementService`
+      now owns it and publishes through the port `service.BetEventPublisher`, which `messaging.BetPublisher`
+      implements (`messaging` → `service`, no cycle). The controller depends on services and `ApiMapper` only, and
+      ArchUnit rule 7 no longer lets `api` use `messaging`. `ApiMapper.toBet` is gone; `toAcceptedResponse(Bet)` takes
+      the `acceptedAt` from `placedAt`.
+    - **Contribution percentages > 0** (§4.3, T8): a fixed 0 % contribution, or a variable one whose `minPercentage` is
+      0, makes every bet (eventually) contribute 0.00. Such a bet is never drawn (§1.3), so the pool could neither grow
+      nor be won again, and the players' contributions stayed locked. `PolicyParameters.requirePositivePercentage`
+      rejects it when the policy is built (startup check, and a runtime-changed jackpot's bets go to the DLT). A fixed
+      0 % reward chance stays allowed: it is an explicit, visible choice.
+    - **Strict consumer JSON** (§7, T11): request bodies were strict since round 1, but the consumer, where the stake
+      is applied, used Spring Kafka's lenient default mapper: a duplicate `betAmount` was applied last-wins and a string
+      amount was coerced. The value delegate `messaging.BetPlacedEventDeserializer` (Spring Kafka's mapper with
+      `STRICT_DUPLICATE_DETECTION` on and `ALLOW_COERCION_OF_SCALARS` off) dead-letters both with their original
+      bytes. Unknown properties are still ignored. It is named in `spring.deserializer.value.delegate.class`, so the
+      `spring.json.*` properties still configure it.
+    - **Latency of producer-supplied `placedAt`** (§6.7): `Timer.record(Duration)` overflowed for a span beyond about
+      292 years (`ArithmeticException` in `Duration.toNanos`). The AFTER_COMMIT listener then failed after a
+      committed payout, before the `WON` counter, the reward summary and the business log line. The listener now
+      records the meters and the log line first and the latency last, and only for a span within [0, 30 days].
+    - **Bounded policy messages** (§4.3): like `Bet` in round 1, policy and draw validation messages quoted rejected
+      values with `toPlainString()`; a stored `1e-999999999` then raised an `OutOfMemoryError` at startup (or killed a
+      consumer thread) instead of a `JackpotConfigurationException`. They now use `toString()`.
+    - **Compose volumes** (§10): PostgreSQL and Kafka used anonymous volumes, so a plain `docker compose down` lost
+      all data (the README implied only `down -v` did) and left the old volumes dangling. The broker also wrote to
+      `/tmp/kafka-logs`, outside its image volume. Both now use named volumes, with `KAFKA_LOG_DIRS=/var/lib/kafka/data`,
+      and the Kafka image's two other (empty, unused) volume paths are `tmpfs` mounts. Verified on the live stack: after
+      a plain `down` and `up`, the pools, cycles, bets, topics and consumer offsets were unchanged, and only the two
+      named volumes existed; `down -v` removed them.
+
 ## 13. Verified APIs (Spring Boot 4.1.1 probe — reference implementation compiled and tested)
 
-**Reference:** probe project `/private/tmp/claude-501/-Users-demean-work-private/93d6811c-80ff-4648-a3bf-4bcf0bbf7db2/scratchpad/boot41-probe`
-(working KafkaConfig, PolicyJson, GlobalExceptionHandler, application.yml, test config, KafkaFlowTest, RepositoryTest,
-LockTimeoutTest, BetControllerWebMvcTest, MainAndPropsTest, PostgresKafkaIT), its verified pom
-`…/scratchpad/probe-pom.xml`, and the full notes `…/scratchpad/probe-notes.txt`. **Read the notes before writing code.**
+The APIs below were verified in a throw-away probe project during design.
 
 Key facts:
 - Starters: `spring-boot-starter-webmvc`, `-validation`, `-data-jpa`, `-flyway` (+ `org.flywaydb:flyway-database-postgresql`), `-kafka`,
@@ -767,7 +875,7 @@ Key facts:
   Lock timeout → `CannotAcquireLockException` (a `TransientDataAccessException`).
 - `ResponseEntityExceptionHandler` overrides take `HttpStatusCode`. `ProblemDetail.setProperty`. `NoResourceFoundException` for unknown URLs.
 - Testcontainers with colima: `TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE=/var/run/docker.sock` (+ optional
-  `DOCKER_HOST=unix:///Users/demean/.colima/default/docker.sock`); `org.testcontainers.postgresql.PostgreSQLContainer`,
+  `DOCKER_HOST=unix://$HOME/.colima/default/docker.sock`); `org.testcontainers.postgresql.PostgreSQLContainer`,
   `org.testcontainers.kafka.KafkaContainer("apache/kafka:4.2.1")` with `@ServiceConnection`.
-- Local tooling: `docker compose` v5.5.1 is installed as a CLI plugin (`~/.docker/cli-plugins`); there is no buildx and BuildKit
-  fails (credsStore=desktop) — build images with `DOCKER_BUILDKIT=0 docker build` (the Dockerfile must not need BuildKit).
+- Docker CLIs without buildx: if BuildKit is unavailable, build with `DOCKER_BUILDKIT=0 docker build` (the Dockerfile must not
+  need BuildKit).

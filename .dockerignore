@@ -1,4 +1,4 @@
-# Only pom.xml, the Maven wrapper and src/ are needed to build the image.
+# Only pom.xml and src/ are needed to build the image (it builds with the base image's Maven, not the wrapper).
 target/
 .git/
 .gitignore

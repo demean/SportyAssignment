@@ -5,16 +5,19 @@ import static org.assertj.core.api.Assertions.assertThat;
 import ch.qos.logback.classic.Level;
 import com.sporty.jackpot.domain.model.EvaluationOutcome;
 import com.sporty.jackpot.domain.model.ProcessingStatus;
-import com.sporty.jackpot.service.ServiceLogCapture;
+import com.sporty.jackpot.support.LogCapture;
 import io.micrometer.core.instrument.DistributionSummary;
 import io.micrometer.core.instrument.Timer;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.math.BigDecimal;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.transaction.event.TransactionPhase;
 import org.springframework.transaction.event.TransactionalEventListener;
 
@@ -90,7 +93,7 @@ class BetProcessingMetricsTest {
     @Test
     @DisplayName("WON: processed{PROCESSED}, evaluations{WON}, reward amount, latency, INFO log")
     void wonBet() {
-        try (ServiceLogCapture logs = ServiceLogCapture.of(BetProcessingMetrics.class)) {
+        try (LogCapture logs = LogCapture.of(BetProcessingMetrics.class)) {
             metrics.onProcessed(won("bet-1", "1010.00"));
 
             assertThat(logs.messages(Level.INFO))
@@ -110,7 +113,7 @@ class BetProcessingMetricsTest {
     @Test
     @DisplayName("LOST: processed{PROCESSED}, evaluations{LOST}, latency, no reward, INFO log")
     void lostBet() {
-        try (ServiceLogCapture logs = ServiceLogCapture.of(BetProcessingMetrics.class)) {
+        try (LogCapture logs = LogCapture.of(BetProcessingMetrics.class)) {
             metrics.onProcessed(lost("bet-2"));
 
             assertThat(logs.messages(Level.INFO))
@@ -129,7 +132,7 @@ class BetProcessingMetricsTest {
     @Test
     @DisplayName("NO_MATCHING_JACKPOT: processed{NO_MATCHING_JACKPOT}, latency, no evaluation/reward, WARN log")
     void noMatchingJackpot() {
-        try (ServiceLogCapture logs = ServiceLogCapture.of(BetProcessingMetrics.class)) {
+        try (LogCapture logs = LogCapture.of(BetProcessingMetrics.class)) {
             metrics.onProcessed(noMatchingJackpot("bet-3"));
 
             assertThat(logs.messages(Level.WARN)).containsExactly("Bet bet-3 references unknown jackpot "
@@ -156,7 +159,70 @@ class BetProcessingMetricsTest {
 
         assertThat(processed(ProcessingStatus.PROCESSED)).isEqualTo(1.0);
         assertThat(evaluations(EvaluationOutcome.LOST)).isEqualTo(1.0);
-        assertThat(latency().count()).as("negative durations are dropped by Micrometer").isZero();
+        assertThat(latency().count()).as("a negative span is not a latency").isZero();
+    }
+
+    /**
+     * {@code placedAt} comes from the Kafka payload: producers other than the API (or a hand-edited dead-letter
+     * replay) may send any instant. A span beyond about 292 years overflowed the timer's nanoseconds, and the
+     * {@code ArithmeticException} of this after-commit listener lost the committed payout's meters and log line.
+     */
+    @ParameterizedTest(name = "placedAt {0}")
+    @ValueSource(strings = {
+            "1700-01-01T00:00:00Z",           // 326 years before: overflowed Duration.toNanos()
+            "2999-01-01T00:00:00Z",           // 973 years after: overflowed too, in the negative direction
+            "1970-01-01T00:00:00Z",           // 56 years: fits, but would dominate the timer's sum and max
+            "2026-08-24T10:15:30.123456788Z"  // one nanosecond more than MAX_RECORDED_LATENCY
+    })
+    @DisplayName("an implausible placedAt never costs a committed payout its meters and log line; no latency recorded")
+    void implausibleLatencyIsNotRecorded(String placedAt) {
+        BetProcessedEvent won = new BetProcessedEvent(ProcessingStatus.PROCESSED, "bet-6", "jackpot-1",
+                EvaluationOutcome.WON, new BigDecimal("5.00"), new BigDecimal("105.00"), Instant.parse(placedAt),
+                PROCESSED_AT);
+
+        try (LogCapture logs = LogCapture.of(BetProcessingMetrics.class)) {
+            metrics.onProcessed(won);
+
+            assertThat(logs.messages(Level.INFO))
+                    .containsExactly("Bet bet-6 WON 105.00 on jackpot jackpot-1 (contributed 5.00); pool reset");
+        }
+
+        assertThat(processed(ProcessingStatus.PROCESSED)).isEqualTo(1.0);
+        assertThat(evaluations(EvaluationOutcome.WON)).isEqualTo(1.0);
+        assertThat(rewards().count()).isOne();
+        assertThat(rewards().totalAmount()).isEqualTo(105.0);
+        assertThat(latency().count()).as("not a processing latency").isZero();
+    }
+
+    @Test
+    @DisplayName("an implausible placedAt of a bet for an unknown jackpot still counts it and logs the WARN")
+    void implausibleLatencyOfAnUnknownJackpotBet() {
+        BetProcessedEvent unknown = new BetProcessedEvent(ProcessingStatus.NO_MATCHING_JACKPOT, "bet-7",
+                "jackpot-unknown", null, null, null, Instant.parse("1700-01-01T00:00:00Z"), PROCESSED_AT);
+
+        try (LogCapture logs = LogCapture.of(BetProcessingMetrics.class)) {
+            metrics.onProcessed(unknown);
+
+            assertThat(logs.messages(Level.WARN)).singleElement().asString().startsWith("Bet bet-7 references "
+                    + "unknown jackpot jackpot-unknown");
+        }
+
+        assertThat(processed(ProcessingStatus.NO_MATCHING_JACKPOT)).isEqualTo(1.0);
+        assertThat(latency().count()).isZero();
+    }
+
+    @Test
+    @DisplayName("a span of exactly MAX_RECORDED_LATENCY (30 days, the dead-letter retention) is still recorded")
+    void latencyAtTheLimitIsRecorded() {
+        BetProcessedEvent replayed = new BetProcessedEvent(ProcessingStatus.PROCESSED, "bet-8", "jackpot-1",
+                EvaluationOutcome.LOST, new BigDecimal("1.00"), new BigDecimal("0.00"),
+                PROCESSED_AT.minus(BetProcessingMetrics.MAX_RECORDED_LATENCY), PROCESSED_AT);
+
+        metrics.onProcessed(replayed);
+
+        assertThat(BetProcessingMetrics.MAX_RECORDED_LATENCY).isEqualTo(Duration.ofDays(30));
+        assertThat(latency().count()).isOne();
+        assertThat(latency().totalTime(TimeUnit.DAYS)).isEqualTo(30.0);
     }
 
     @Test

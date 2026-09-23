@@ -8,7 +8,9 @@ import com.sporty.jackpot.domain.policy.FixedContributionPolicy;
 import com.sporty.jackpot.domain.policy.VariableContributionPolicy;
 import com.sporty.jackpot.exception.ErrorCode;
 import com.sporty.jackpot.exception.JackpotConfigurationException;
+import jakarta.persistence.Converter;
 import java.math.BigDecimal;
+import org.hibernate.annotations.Immutable;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -58,6 +60,12 @@ class ContributionPolicyConverterTest {
     }
 
     @Test
+    @DisplayName("is a JPA converter marked @Immutable: policies are immutable records, never deep-copied (T20)")
+    void isAnImmutableConverter() {
+        assertThat(ContributionPolicyConverter.class).hasAnnotation(Converter.class).hasAnnotation(Immutable.class);
+    }
+
+    @Test
     @DisplayName("maps null to null in both directions")
     void mapsNullToNull() {
         assertThat(converter.convertToDatabaseColumn(null)).isNull();
@@ -88,6 +96,9 @@ class ContributionPolicyConverterTest {
             missing parameter         | {"type":"FIXED"}                         | percentage must not be null
             percentage above 100      | {"type":"FIXED","percentage":100.01}     | percentage must be within [0, 100] but was 100.01
             negative percentage       | {"type":"FIXED","percentage":-1}         | percentage must be within [0, 100] but was -1
+            zero percentage           | {"type":"FIXED","percentage":0}          | percentage must be > 0 but was 0
+            zero floor                | {"type":"VARIABLE","startPercentage":10,"minPercentage":0,"decayPercentage":0.5,"poolIncreaseStep":1000}  | minPercentage must be > 0 but was 0
+            extreme exponent          | {"type":"FIXED","percentage":1e-999999999}  | percentage must have at most 4 decimals but was 1E-999999999
             min above start           | {"type":"VARIABLE","startPercentage":1,"minPercentage":2,"decayPercentage":0,"poolIncreaseStep":1}   | minPercentage (2) must not exceed startPercentage (1)
             zero pool increase step   | {"type":"VARIABLE","startPercentage":2,"minPercentage":1,"decayPercentage":0,"poolIncreaseStep":0}   | poolIncreaseStep must be > 0 but was 0
             negative decay            | {"type":"VARIABLE","startPercentage":2,"minPercentage":1,"decayPercentage":-1,"poolIncreaseStep":1}  | decayPercentage must be >= 0 but was -1

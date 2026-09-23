@@ -73,7 +73,24 @@ class KafkaListenersHealthIndicatorTest {
     }
 
     private void givenContainers(MessageListenerContainer... containers) {
+        when(registry.isRunning()).thenReturn(true);
         when(registry.getListenerContainers()).thenReturn(Arrays.asList(containers));
+    }
+
+    @Test
+    @DisplayName("UP while the registry itself is not running (before startup, during a graceful shutdown)")
+    void upWhileTheRegistryIsStopped() {
+        MessageListenerContainer stoppedForShutdown = mock(MessageListenerContainer.class);
+        when(stoppedForShutdown.getListenerId()).thenReturn("listener-a");
+        when(registry.getListenerContainers()).thenReturn(List.of(stoppedForShutdown));
+        when(registry.isRunning()).thenReturn(false);
+
+        Health health = indicator.health();
+
+        assertThat(health.getStatus()).isEqualTo(Status.UP);
+        assertThat(health.getDetails())
+                .containsEntry("containers", List.of("listener-a"))
+                .containsEntry("stopped", List.of());
     }
 
     private static MessageListenerContainer container(String id, boolean autoStartup, boolean running) {

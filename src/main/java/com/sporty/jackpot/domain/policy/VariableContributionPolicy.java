@@ -10,8 +10,8 @@ import java.math.MathContext;
  * {@code poolIncreaseStep} the pool has grown above its initial value, floored at {@code minPercentage}:
  * {@code max(min, start − decay × max(0, pool − initial) / step)}.
  *
- * @param startPercentage  percentage while the pool is at (or below) its initial value, in [0, 100]
- * @param minPercentage    floor, in [0, startPercentage]
+ * @param startPercentage  percentage while the pool is at (or below) its initial value, in [minPercentage, 100]
+ * @param minPercentage    floor, in (0, startPercentage]: a floor of 0 % would stop every draw once reached
  * @param decayPercentage  decrease per step, {@code >= 0}
  * @param poolIncreaseStep pool growth per decay step, {@code > 0}
  */
@@ -21,10 +21,10 @@ public record VariableContributionPolicy(BigDecimal startPercentage, BigDecimal 
 
     public VariableContributionPolicy {
         PolicyParameters.requirePercentage("startPercentage", startPercentage);
-        PolicyParameters.requirePercentage("minPercentage", minPercentage);
+        PolicyParameters.requirePositivePercentage("minPercentage", minPercentage);
         if (minPercentage.compareTo(startPercentage) > 0) {
-            throw new JackpotConfigurationException("minPercentage (" + minPercentage.toPlainString()
-                    + ") must not exceed startPercentage (" + startPercentage.toPlainString() + ")");
+            throw new JackpotConfigurationException("minPercentage (" + minPercentage
+                    + ") must not exceed startPercentage (" + startPercentage + ")");
         }
         PolicyParameters.requireNonNegative("decayPercentage", decayPercentage);
         PolicyParameters.requirePositive("poolIncreaseStep", poolIncreaseStep);

@@ -1,9 +1,10 @@
 package com.sporty.jackpot.service;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.Assertions.catchThrowableOfType;
-import static org.mockito.Mockito.never;
-import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.inOrder;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 import com.sporty.jackpot.domain.model.BetEvaluation;
@@ -24,15 +25,15 @@ import com.sporty.jackpot.persistence.repository.BetRepository;
 import com.sporty.jackpot.persistence.repository.JackpotContributionRepository;
 import java.math.BigDecimal;
 import java.time.Instant;
+import java.util.Locale;
 import java.util.Optional;
-import java.util.stream.Stream;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.params.ParameterizedTest;
-import org.junit.jupiter.params.provider.Arguments;
-import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.EnumSource;
+import org.mockito.InOrder;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.transaction.annotation.Transactional;
@@ -60,11 +61,8 @@ class BetQueryServiceTest {
                 new EntityMapper());
     }
 
-    /** Bet row exists -> 422 BET_NOT_CONTRIBUTING (no matching jackpot); no bet row -> 404 BET_NOT_FOUND. */
-    static Stream<Arguments> missingRow() {
-        return Stream.of(
-                Arguments.of(true, BetNotContributingException.class, ErrorCode.BET_NOT_CONTRIBUTING),
-                Arguments.of(false, BetNotFoundException.class, ErrorCode.BET_NOT_FOUND));
+    private static BetEntity storedBet(BetStatus status) {
+        return new BetEntity(BET_ID, "user-1", "jackpot-1", new BigDecimal("25.50"), status, PLACED_AT, PROCESSED_AT);
     }
 
     private static void assertMissing(JackpotServiceException exception,
@@ -72,6 +70,23 @@ class BetQueryServiceTest {
         assertThat(exception).isExactlyInstanceOf(expectedType);
         assertThat(exception.getErrorCode()).isEqualTo(expectedCode);
         assertThat(exception.getMessage()).contains("'" + BET_ID + "'");
+    }
+
+    /** The two lookups of a bet's processing result. */
+    enum Lookup {
+        CONTRIBUTION, EVALUATION;
+
+        Object apply(BetQueryService service) {
+            return this == CONTRIBUTION ? service.getContribution(BET_ID) : service.getEvaluation(BET_ID);
+        }
+    }
+
+    private void givenNoResultRow(Lookup lookup) {
+        if (lookup == Lookup.CONTRIBUTION) {
+            when(contributionRepository.findByBetId(BET_ID)).thenReturn(Optional.empty());
+        } else {
+            when(evaluationRepository.findByBetId(BET_ID)).thenReturn(Optional.empty());
+        }
     }
 
     @Test
@@ -110,8 +125,9 @@ class BetQueryServiceTest {
     }
 
     @Test
-    @DisplayName("getContribution maps the stored contribution without checking the bet row")
+    @DisplayName("getContribution reads the bet row first, then maps the stored contribution")
     void getContributionFound() {
+        when(betRepository.findById(BET_ID)).thenReturn(Optional.of(storedBet(BetStatus.CONTRIBUTED)));
         when(contributionRepository.findByBetId(BET_ID)).thenReturn(Optional.of(new JackpotContributionEntity(BET_ID,
                 "user-1", "jackpot-1", new BigDecimal("250.00"), new BigDecimal("12.50"), new BigDecimal("1012.50"),
                 3, PROCESSED_AT)));
@@ -120,24 +136,15 @@ class BetQueryServiceTest {
 
         assertThat(contribution).isEqualTo(new Contribution(BET_ID, "user-1", "jackpot-1", new BigDecimal("250.00"),
                 new BigDecimal("12.50"), new BigDecimal("1012.50"), 3, PROCESSED_AT));
-        verify(betRepository, never()).existsById(BET_ID);
-    }
-
-    @ParameterizedTest(name = "bet row exists = {0} -> {2}")
-    @MethodSource("missingRow")
-    @DisplayName("getContribution without a row -> BET_NOT_CONTRIBUTING if the bet exists, else BET_NOT_FOUND")
-    void getContributionMissing(boolean betExists, Class<? extends JackpotServiceException> expectedType,
-                                ErrorCode expectedCode) {
-        when(contributionRepository.findByBetId(BET_ID)).thenReturn(Optional.empty());
-        when(betRepository.existsById(BET_ID)).thenReturn(betExists);
-
-        assertMissing(catchThrowableOfType(JackpotServiceException.class, () -> service.getContribution(BET_ID)),
-                expectedType, expectedCode);
+        InOrder order = inOrder(betRepository, contributionRepository);
+        order.verify(betRepository).findById(BET_ID);
+        order.verify(contributionRepository).findByBetId(BET_ID);
     }
 
     @Test
-    @DisplayName("getEvaluation maps the stored evaluation without checking the bet row")
+    @DisplayName("getEvaluation reads the bet row first, then maps the stored evaluation")
     void getEvaluationFound() {
+        when(betRepository.findById(BET_ID)).thenReturn(Optional.of(storedBet(BetStatus.CONTRIBUTED)));
         when(evaluationRepository.findByBetId(BET_ID)).thenReturn(Optional.of(new BetEvaluationEntity(BET_ID, "user-1",
                 "jackpot-1", EvaluationOutcome.WON, new BigDecimal("1.0000"), new BigDecimal("1010.00"), 3,
                 PROCESSED_AT)));
@@ -147,18 +154,42 @@ class BetQueryServiceTest {
         assertThat(evaluation).isEqualTo(new BetEvaluation(BET_ID, "user-1", "jackpot-1", EvaluationOutcome.WON,
                 new BigDecimal("1.0000"), new BigDecimal("1010.00"), 3, PROCESSED_AT));
         assertThat(evaluation.won()).isTrue();
-        verify(betRepository, never()).existsById(BET_ID);
+        InOrder order = inOrder(betRepository, evaluationRepository);
+        order.verify(betRepository).findById(BET_ID);
+        order.verify(evaluationRepository).findByBetId(BET_ID);
     }
 
-    @ParameterizedTest(name = "bet row exists = {0} -> {2}")
-    @MethodSource("missingRow")
-    @DisplayName("getEvaluation without a row -> BET_NOT_CONTRIBUTING if the bet exists, else BET_NOT_FOUND")
-    void getEvaluationMissing(boolean betExists, Class<? extends JackpotServiceException> expectedType,
-                              ErrorCode expectedCode) {
-        when(evaluationRepository.findByBetId(BET_ID)).thenReturn(Optional.empty());
-        when(betRepository.existsById(BET_ID)).thenReturn(betExists);
+    @ParameterizedTest(name = "{0}")
+    @EnumSource(Lookup.class)
+    @DisplayName("no bet row (unknown or not processed yet) -> BET_NOT_FOUND, the result tables are not read")
+    void unknownBetIsNotFound(Lookup lookup) {
+        when(betRepository.findById(BET_ID)).thenReturn(Optional.empty());
 
-        assertMissing(catchThrowableOfType(JackpotServiceException.class, () -> service.getEvaluation(BET_ID)),
-                expectedType, expectedCode);
+        assertMissing(catchThrowableOfType(JackpotServiceException.class, () -> lookup.apply(service)),
+                BetNotFoundException.class, ErrorCode.BET_NOT_FOUND);
+        verifyNoInteractions(contributionRepository, evaluationRepository);
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @EnumSource(Lookup.class)
+    @DisplayName("a bet stored as NO_MATCHING_JACKPOT -> BET_NOT_CONTRIBUTING, the result tables are not read")
+    void betWithoutJackpotIsNotContributing(Lookup lookup) {
+        when(betRepository.findById(BET_ID)).thenReturn(Optional.of(storedBet(BetStatus.NO_MATCHING_JACKPOT)));
+
+        assertMissing(catchThrowableOfType(JackpotServiceException.class, () -> lookup.apply(service)),
+                BetNotContributingException.class, ErrorCode.BET_NOT_CONTRIBUTING);
+        verifyNoInteractions(contributionRepository, evaluationRepository);
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @EnumSource(Lookup.class)
+    @DisplayName("a CONTRIBUTED bet without its result row is a broken invariant (never 404 or 422)")
+    void contributedBetWithoutResultRowIsABrokenInvariant(Lookup lookup) {
+        when(betRepository.findById(BET_ID)).thenReturn(Optional.of(storedBet(BetStatus.CONTRIBUTED)));
+        givenNoResultRow(lookup);
+
+        assertThatThrownBy(() -> lookup.apply(service))
+                .isExactlyInstanceOf(IllegalStateException.class)
+                .hasMessage("Bet '" + BET_ID + "' is CONTRIBUTED but has no stored " + lookup.name().toLowerCase(Locale.ROOT));
     }
 }

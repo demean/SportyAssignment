@@ -1,9 +1,11 @@
 # All-in-one local environment: `docker compose up --build`
-# (on machines without buildx/BuildKit: `DOCKER_BUILDKIT=0 COMPOSE_DOCKER_CLI_BUILD=0 docker compose up --build`).
+# (if the image build fails locally, see the troubleshooting table in README.md section 1).
 #   API            http://localhost:8080/api/v1/jackpots   (Swagger UI: http://localhost:8080/swagger-ui.html)
 #   Management     http://localhost:8081/actuator/health
 #   Kafka UI       http://localhost:8090
 #   Kafka (host)   localhost:9092     PostgreSQL (host) localhost:${POSTGRES_HOST_PORT:-5432} (jackpot/jackpot)
+# Data (topics, consumer offsets, database) lives in named volumes: `docker compose down` keeps it,
+# `docker compose down -v` deletes it (the next `up` then starts with freshly seeded jackpots).
 name: jackpot
 
 services:
@@ -25,6 +27,14 @@ services:
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      # the image's default log dir for an env-configured broker is /tmp/kafka-logs, outside any volume
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    # the image also declares these (unused, empty) volumes: tmpfs keeps each `down` from orphaning them
+    tmpfs:
+      - /etc/kafka/secrets
+      - /mnt/shared/config
     healthcheck:
       test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server kafka:29092 > /dev/null 2>&1"]
       interval: 10s
@@ -41,6 +51,8 @@ services:
       POSTGRES_DB: jackpot
       POSTGRES_USER: jackpot
       POSTGRES_PASSWORD: jackpot
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U jackpot -d jackpot"]
       interval: 5s
@@ -82,3 +94,7 @@ services:
       postgres:
         condition: service_healthy
     stop_grace_period: 30s
+
+volumes:
+  kafka-data:
+  postgres-data:

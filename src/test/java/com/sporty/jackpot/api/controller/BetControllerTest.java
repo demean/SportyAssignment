@@ -9,6 +9,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Named.named;
 import static org.junit.jupiter.params.provider.Arguments.arguments;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.BDDMockito.given;
 import static org.mockito.BDDMockito.then;
 
@@ -25,7 +26,7 @@ import com.sporty.jackpot.exception.BetNotFoundException;
 import com.sporty.jackpot.exception.BetPublishingException;
 import com.sporty.jackpot.exception.ErrorCode;
 import com.sporty.jackpot.exception.InvalidBetException;
-import com.sporty.jackpot.service.BetPublishingService;
+import com.sporty.jackpot.service.BetPlacementService;
 import com.sporty.jackpot.service.BetQueryService;
 import java.math.BigDecimal;
 import java.time.Instant;
@@ -72,10 +73,21 @@ class BetControllerTest {
     private MockMvcTester mvc;
 
     @MockitoBean
-    private BetPublishingService publishingService;
+    private BetPlacementService placementService;
 
     @MockitoBean
     private BetQueryService queryService;
+
+    /** The placement service accepts every bet: it returns it accepted at {@link ApiWebMvcTestConfiguration#NOW}. */
+    private void givenPlacementAcceptsBets() {
+        given(placementService.place(any(), any(), any(), any())).willAnswer(invocation -> new Bet(
+                invocation.getArgument(0), invocation.getArgument(1), invocation.getArgument(2),
+                invocation.getArgument(3), NOW));
+    }
+
+    private void givenPlacementFailsWith(RuntimeException failure) {
+        given(placementService.place(any(), any(), any(), any())).willThrow(failure);
+    }
 
     private MvcTestResult postBet(String json) {
         return mvc.post().uri(BETS).contentType(MediaType.APPLICATION_JSON).content(json).exchange();
@@ -100,10 +112,9 @@ class BetControllerTest {
     class PlaceBet {
 
         @Test
-        @DisplayName("publishes the bet stamped with the clock and answers 202 with Location and body")
+        @DisplayName("hands the request to the placement service and answers 202 with Location and body")
         void acceptsValidBet() {
-            given(publishingService.publish(any(Bet.class)))
-                    .willAnswer(invocation -> invocation.<Bet>getArgument(0).placedAt());
+            givenPlacementAcceptsBets();
 
             MvcTestResult result = postBet(requestJson("bet-1001", "user-42", "jackpot-lucky", "250"));
 
@@ -114,23 +125,24 @@ class BetControllerTest {
                     {"betId":"bet-1001","jackpotId":"jackpot-lucky","status":"ACCEPTED",
                      "acceptedAt":"2026-09-23T10:15:30.123456Z"}
                     """);
-            ArgumentCaptor<Bet> published = ArgumentCaptor.forClass(Bet.class);
-            then(publishingService).should().publish(published.capture());
-            assertThat(published.getValue())
-                    .isEqualTo(new Bet("bet-1001", "user-42", "jackpot-lucky", new BigDecimal("250.00"), NOW));
-            assertThat(published.getValue().amount()).isEqualByComparingTo("250").hasScaleOf(2);
+            ArgumentCaptor<BigDecimal> amount = ArgumentCaptor.forClass(BigDecimal.class);
+            then(placementService).should().place(eq("bet-1001"), eq("user-42"), eq("jackpot-lucky"),
+                    amount.capture());
+            then(placementService).shouldHaveNoMoreInteractions();
+            assertThat(amount.getValue()).isEqualByComparingTo("250");
         }
 
         @Test
-        @DisplayName("reports the instant returned by the publisher as acceptedAt")
-        void acceptedAtIsThePublishersInstant() {
-            Instant acknowledgedAt = Instant.parse("2026-09-23T10:15:31Z");
-            given(publishingService.publish(any(Bet.class))).willReturn(acknowledgedAt);
+        @DisplayName("reports the placed bet's placedAt (the time it was accepted) as acceptedAt")
+        void acceptedAtIsThePlacedBetsInstant() {
+            Instant placedAt = Instant.parse("2026-09-23T10:15:31Z");
+            given(placementService.place(any(), any(), any(), any())).willReturn(
+                    new Bet("bet-1002", "user-42", "jackpot-fixed", new BigDecimal("10.50"), placedAt));
 
             MvcTestResult result = postBet(requestJson("bet-1002", "user-42", "jackpot-fixed", "10.50"));
 
             assertThat(result).hasStatus(HttpStatus.ACCEPTED);
-            assertThat(result).bodyJson().extractingPath("$.acceptedAt").isEqualTo(acknowledgedAt.toString());
+            assertThat(result).bodyJson().extractingPath("$.acceptedAt").isEqualTo(placedAt.toString());
         }
 
         @ParameterizedTest(name = "betId={0}, betAmount={1}")
@@ -139,19 +151,20 @@ class BetControllerTest {
                 "AZaz09._:-x, 1000000000.00",
                 "bet.1:a_b-C, 1000000000",
                 "0123456789012345678901234567890123456789012345678901234567890123, 1.5",
-                "b, 7.10"
+                "b, 7.10",
+                "..., 1.00",
+                ".a., 2.00"
         })
         @DisplayName("accepts every id character and length allowed by Bet.ID_REGEX and the amount bounds")
         void acceptsBoundaryValues(String betId, String amount) {
-            given(publishingService.publish(any(Bet.class))).willReturn(NOW);
+            givenPlacementAcceptsBets();
 
             MvcTestResult result = postBet(requestJson(betId, "user:1", "jackpot_1", amount));
 
             assertThat(result).hasStatus(HttpStatus.ACCEPTED).hasHeader(HttpHeaders.LOCATION, BETS + "/" + betId);
-            ArgumentCaptor<Bet> published = ArgumentCaptor.forClass(Bet.class);
-            then(publishingService).should().publish(published.capture());
-            assertThat(published.getValue().betId()).isEqualTo(betId);
-            assertThat(published.getValue().amount()).isEqualByComparingTo(amount).hasScaleOf(2);
+            ArgumentCaptor<BigDecimal> placedAmount = ArgumentCaptor.forClass(BigDecimal.class);
+            then(placementService).should().place(eq(betId), eq("user:1"), eq("jackpot_1"), placedAmount.capture());
+            assertThat(placedAmount.getValue()).isEqualByComparingTo(amount);
         }
 
         static Stream<Arguments> invalidRequests() {
@@ -168,6 +181,12 @@ class BetControllerTest {
                             List.of(error("betId", ID_PATTERN_MESSAGE))),
                     arguments(named("betId longer than 64", requestJson(tooLong, "user-42", "jackpot-lucky", "250.00")),
                             List.of(error("betId", ID_PATTERN_MESSAGE))),
+                    arguments(named("betId '.' (URL dot segment)", requestJson(".", "user-42", "jackpot-lucky", "1")),
+                            List.of(error("betId", ID_PATTERN_MESSAGE))),
+                    arguments(named("betId '..' (URL dot segment)", requestJson("..", "user-42", "jackpot-lucky", "1")),
+                            List.of(error("betId", ID_PATTERN_MESSAGE))),
+                    arguments(named("jackpotId '..' (URL dot segment)", requestJson("bet-1", "user-42", "..", "1")),
+                            List.of(error("jackpotId", ID_PATTERN_MESSAGE))),
                     arguments(named("blank userId", requestJson("bet-1", "", "jackpot-lucky", "250.00")),
                             List.of(error("userId", ID_PATTERN_MESSAGE), error("userId", NOT_BLANK_MESSAGE))),
                     arguments(named("userId longer than 64", requestJson("bet-1", tooLong, "jackpot-lucky", "250.00")),
@@ -208,7 +227,7 @@ class BetControllerTest {
 
             assertValidationFailed(result, expectedErrors);
             assertNoRetryAfter(result);
-            then(publishingService).shouldHaveNoInteractions();
+            then(placementService).shouldHaveNoInteractions();
         }
 
         @ParameterizedTest(name = "{0}")
@@ -217,7 +236,12 @@ class BetControllerTest {
                 "",
                 "[\"bet-1\"]",
                 "{\"betId\":\"bet-1\",\"userId\":\"user-42\",\"jackpotId\":\"jackpot-lucky\",\"betAmount\":\"lots\"}",
-                "{\"betId\":\"bet-1\",\"userId\":\"user-42\",\"jackpotId\":\"jackpot-lucky\",\"betAmount\":250.00"
+                "{\"betId\":\"bet-1\",\"userId\":\"user-42\",\"jackpotId\":\"jackpot-lucky\",\"betAmount\":250.00",
+                // strict parsing: a duplicate key is never last-wins (a gateway may have read the first stake) ...
+                "{\"betId\":\"bet-1\",\"userId\":\"user-42\",\"jackpotId\":\"jackpot-lucky\",\"betAmount\":1,"
+                        + "\"betAmount\":999999999}",
+                // ... and the stake must be a JSON number, as documented, not a string coerced into one
+                "{\"betId\":\"bet-1\",\"userId\":\"user-42\",\"jackpotId\":\"jackpot-lucky\",\"betAmount\":\"12.50\"}"
         })
         @DisplayName("answers an unreadable body with 400 MALFORMED_REQUEST")
         void rejectsMalformedBody(String body) {
@@ -225,7 +249,7 @@ class BetControllerTest {
 
             assertProblem(result, HttpStatus.BAD_REQUEST, ErrorCode.MALFORMED_REQUEST, "Failed to read request");
             assertThat(result).bodyJson().doesNotHavePath("$.errors");
-            then(publishingService).shouldHaveNoInteractions();
+            then(placementService).shouldHaveNoInteractions();
         }
 
         @ParameterizedTest(name = "{0}")
@@ -238,7 +262,7 @@ class BetControllerTest {
 
             assertProblem(result, HttpStatus.UNSUPPORTED_MEDIA_TYPE, ErrorCode.UNSUPPORTED_MEDIA_TYPE);
             assertThat(result).hasHeader(HttpHeaders.ACCEPT, MediaType.APPLICATION_JSON_VALUE);
-            then(publishingService).shouldHaveNoInteractions();
+            then(placementService).shouldHaveNoInteractions();
         }
 
         @ParameterizedTest(name = "Accept: {0}")
@@ -251,14 +275,14 @@ class BetControllerTest {
 
             assertProblem(result, HttpStatus.NOT_ACCEPTABLE, ErrorCode.NOT_ACCEPTABLE);
             assertNoRetryAfter(result);
-            then(publishingService).shouldHaveNoInteractions();
+            then(placementService).shouldHaveNoInteractions();
         }
 
         @ParameterizedTest(name = "Accept: {0}")
         @ValueSource(strings = {MediaType.APPLICATION_JSON_VALUE, "application/*+json", "application/*", "*/*"})
         @DisplayName("accepts a bet from a client accepting JSON")
         void acceptsJsonCompatibleAcceptHeader(String accept) {
-            given(publishingService.publish(any(Bet.class))).willReturn(NOW);
+            givenPlacementAcceptsBets();
 
             MvcTestResult result = mvc.post().uri(BETS).contentType(MediaType.APPLICATION_JSON)
                     .header(HttpHeaders.ACCEPT, accept)
@@ -277,14 +301,13 @@ class BetControllerTest {
 
             assertProblem(result, HttpStatus.METHOD_NOT_ALLOWED, ErrorCode.METHOD_NOT_ALLOWED);
             assertThat(result).hasHeader(HttpHeaders.ALLOW, HttpMethod.POST.name());
-            then(publishingService).shouldHaveNoInteractions();
+            then(placementService).shouldHaveNoInteractions();
         }
 
         @Test
         @DisplayName("answers an unconfirmed publish with 503 BET_PUBLISH_FAILED, Retry-After and the betId")
         void reportsPublishFailure() {
-            given(publishingService.publish(any(Bet.class)))
-                    .willThrow(new BetPublishingException("bet-1001", new TimeoutException("no ack")));
+            givenPlacementFailsWith(new BetPublishingException("bet-1001", new TimeoutException("no ack")));
 
             MvcTestResult result = postBet(requestJson("bet-1001", "user-42", "jackpot-lucky", "250.00"));
 
@@ -297,10 +320,10 @@ class BetControllerTest {
         }
 
         @Test
-        @DisplayName("answers a domain invariant violation with 400 INVALID_BET and its message")
+        @DisplayName("answers a domain invariant violation (raised by the placement service) with 400 INVALID_BET")
         void reportsInvalidBet() {
-            given(publishingService.publish(any(Bet.class)))
-                    .willThrow(new InvalidBetException("amount must not exceed 1000000000.00 but was 1000000000.01"));
+            givenPlacementFailsWith(
+                    new InvalidBetException("amount must not exceed 1000000000.00 but was 1000000000.01"));
 
             MvcTestResult result = postBet(requestJson("bet-1001", "user-42", "jackpot-lucky", "250.00"));
 
@@ -473,7 +496,9 @@ class BetControllerTest {
                 "/api/v1/bets/{betId}              | bad id!",
                 "/api/v1/bets/{betId}/contribution | bet#1",
                 "/api/v1/bets/{betId}/evaluation   | bet+1",
-                "/api/v1/bets/{betId}              | 01234567890123456789012345678901234567890123456789012345678901234"
+                "/api/v1/bets/{betId}              | 01234567890123456789012345678901234567890123456789012345678901234",
+                "/api/v1/bets/{betId}/evaluation   | ..",
+                "/api/v1/bets/{betId}/contribution | ."
         })
         @DisplayName("answers an id not matching Bet.ID_REGEX with 400 VALIDATION_FAILED on betId")
         void rejectsInvalidBetId(String uriTemplate, String betId) {

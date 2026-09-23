@@ -71,14 +71,14 @@ class RewardDrawTest {
     }
 
     @ParameterizedTest(name = "chance {0} is rejected without drawing")
-    @ValueSource(strings = {"-0.0001", "-1", "100.0001", "100.00001", "1000"})
+    @ValueSource(strings = {"-0.0001", "-1", "100.0001", "100.00001", "1000", "1e999999999", "-1e999999999"})
     void chanceOutsideZeroToHundredIsRejected(String chance) {
         StubRandomGenerator random = new StubRandomGenerator(LOWEST_DRAW);
         RewardDraw rewardDraw = new RewardDraw(random);
 
         assertThatIllegalArgumentException()
                 .isThrownBy(() -> rewardDraw.isWinning(new BigDecimal(chance)))
-                .withMessage("chancePercentage must be within [0, 100] but was " + chance);
+                .withMessage("chancePercentage must be within [0, 100] but was " + new BigDecimal(chance));
         assertThat(random.requestedBounds()).isEmpty();
         assertThat(random.remaining()).isOne();
     }

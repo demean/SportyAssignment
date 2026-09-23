@@ -23,6 +23,14 @@ public class BetProcessingMetrics {
     static final String REWARDS_SUMMARY = "jackpot.rewards.amount";
     static final String LATENCY_TIMER = "jackpot.bets.processing.latency";
 
+    /**
+     * Longest span recorded as processing latency (the dead-letter retention, so replays within it are covered).
+     * {@code placedAt} comes from the Kafka payload, which producers other than the API (or a hand-edited replay) may
+     * set to anything: a longer or negative span is not a processing latency, and a span beyond about 292 years does
+     * not even fit the timer's nanoseconds ({@code ArithmeticException}).
+     */
+    static final Duration MAX_RECORDED_LATENCY = Duration.ofDays(30);
+
     private static final Logger log = LoggerFactory.getLogger(BetProcessingMetrics.class);
 
     private final MeterRegistry registry;
@@ -40,19 +48,24 @@ public class BetProcessingMetrics {
     }
 
     /**
-     * Records a committed processing result.
+     * Records a committed processing result. The payout meters and the business log line come first, the latency
+     * last: nothing about the result can be lost to an implausible {@code placedAt}.
      *
      * @param event the committed result
      */
     @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
     public void onProcessed(BetProcessedEvent event) {
         registry.counter(PROCESSED_COUNTER, "status", event.status().name()).increment();
-        latency.record(Duration.between(event.placedAt(), event.processedAt()));
         if (event.status() == ProcessingStatus.NO_MATCHING_JACKPOT) {
             log.warn("Bet {} references unknown jackpot {}: stored as NO_MATCHING_JACKPOT (no contribution, "
                     + "no evaluation)", event.betId(), event.jackpotId());
-            return;
+        } else {
+            recordEvaluation(event);
         }
+        recordLatency(Duration.between(event.placedAt(), event.processedAt()));
+    }
+
+    private void recordEvaluation(BetProcessedEvent event) {
         registry.counter(EVALUATIONS_COUNTER, "outcome", event.outcome().name()).increment();
         if (event.outcome() == EvaluationOutcome.WON) {
             rewards.record(event.rewardAmount().doubleValue());
@@ -61,6 +74,13 @@ public class BetProcessingMetrics {
         } else {
             log.info("Bet {} processed on jackpot {}: contributed {}, LOST", event.betId(), event.jackpotId(),
                     event.contributionAmount());
+        }
+    }
+
+    /** Records only plausible processing times: within [0, {@link #MAX_RECORDED_LATENCY}]. */
+    private void recordLatency(Duration sinceAccepted) {
+        if (!sinceAccepted.isNegative() && sinceAccepted.compareTo(MAX_RECORDED_LATENCY) <= 0) {
+            latency.record(sinceAccepted);
         }
     }
 }

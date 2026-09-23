@@ -9,8 +9,9 @@ WORKDIR /workspace
 COPY pom.xml ./
 RUN mvn -B -q -DskipTests -Djacoco.skip=true dependency:go-offline
 
+# maven.test.skip: the image build neither runs nor compiles the tests (./mvnw verify is the quality gate)
 COPY src/ src/
-RUN mvn -B -q -DskipTests -Djacoco.skip=true package \
+RUN mvn -B -q -Dmaven.test.skip=true -Djacoco.skip=true package \
     && java -Djarmode=tools -jar target/jackpot-service-1.0.0.jar extract --layers --launcher --destination target/extracted
 
 # ---- runtime: JRE only, non-root, one layer per Boot layer (dependencies change rarely) ----

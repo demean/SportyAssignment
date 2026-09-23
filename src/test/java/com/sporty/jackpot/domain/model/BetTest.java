@@ -44,7 +44,7 @@ class BetTest {
 
     @Test
     void constants() {
-        assertThat(Bet.ID_REGEX).isEqualTo("^[A-Za-z0-9._:-]{1,64}$");
+        assertThat(Bet.ID_REGEX).isEqualTo("^(?!\\.{1,2}$)[A-Za-z0-9._:-]{1,64}$");
         assertThat(Bet.MAX_AMOUNT).isEqualByComparingTo("1000000000.00");
     }
 
@@ -65,12 +65,16 @@ class BetTest {
         static Stream<Arguments> invalidIds() {
             return idFields().flatMap(field -> Stream.of(
                             null, "", " ", "   ", "bet 1", " bet", "bet ", "bet/1", "bet#1", "bet\n", "bét", "bet;1",
+                            // URL dot segments: /api/v1/bets/.. would resolve to another resource
+                            ".", "..",
                             TOO_LONG_ID)
                     .map(id -> Arguments.of(field.get()[0], field.get()[1], id)));
         }
 
         static Stream<Arguments> validIds() {
-            return idFields().flatMap(field -> Stream.of("a", "Z", "0", "a.b_c:d-e", "BET-2026:01.x_y", MAX_LENGTH_ID)
+            return idFields().flatMap(field -> Stream.of("a", "Z", "0", "a.b_c:d-e", "BET-2026:01.x_y", MAX_LENGTH_ID,
+                            // dots are fine unless the whole id is a dot segment
+                            "...", ".a", "a.", "..a", "a..")
                     .map(id -> Arguments.of(field.get()[0], field.get()[1], id)));
         }
 
@@ -95,6 +99,27 @@ class BetTest {
                 default -> bet.jackpotId();
             };
             assertThat(actual).isEqualTo(id);
+        }
+
+        @ParameterizedTest(name = "{0} characters")
+        @ValueSource(ints = {81, 350_000})
+        @DisplayName("a rejected id longer than 80 characters is quoted cut to 80 characters plus its length")
+        void longRejectedIdIsQuotedCut(int length) {
+            String id = "!".repeat(length);
+
+            assertThatThrownBy(() -> new Bet(id, "u", "j", BigDecimal.ONE, PLACED_AT))
+                    .isInstanceOf(InvalidBetException.class)
+                    .hasMessage("betId must match " + Bet.ID_REGEX + " but was '" + "!".repeat(80) + "...' ("
+                            + length + " characters)");
+        }
+
+        @Test
+        @DisplayName("an id of exactly 80 characters is quoted in full")
+        void rejectedIdOfEightyCharactersIsQuotedInFull() {
+            String id = "!".repeat(80);
+
+            assertThatThrownBy(() -> new Bet(id, "u", "j", BigDecimal.ONE, PLACED_AT))
+                    .hasMessageEndingWith("but was '" + id + "'");
         }
 
         @Test
@@ -124,7 +149,7 @@ class BetTest {
         void rejectsZeroAndNegativeAmounts(String amount) {
             assertThatThrownBy(() -> bet(amount))
                     .isInstanceOf(InvalidBetException.class)
-                    .hasMessage("amount must be positive but was " + new BigDecimal(amount).toPlainString());
+                    .hasMessage("amount must be positive but was " + new BigDecimal(amount));
         }
 
         @ParameterizedTest(name = "{0}")
@@ -132,7 +157,7 @@ class BetTest {
         void rejectsMoreThanTwoSignificantDecimals(String amount) {
             assertThatThrownBy(() -> bet(amount))
                     .isInstanceOf(InvalidBetException.class)
-                    .hasMessage("amount must have at most 2 decimals but was " + amount);
+                    .hasMessage("amount must have at most 2 decimals but was " + new BigDecimal(amount));
         }
 
         @ParameterizedTest(name = "{0}")
@@ -140,7 +165,25 @@ class BetTest {
         void rejectsAmountsAboveTheMaximum(String amount) {
             assertThatThrownBy(() -> bet(amount))
                     .isInstanceOf(InvalidBetException.class)
-                    .hasMessage("amount must not exceed 1000000000.00 but was " + new BigDecimal(amount).toPlainString());
+                    .hasMessage("amount must not exceed 1000000000.00 but was " + new BigDecimal(amount));
+        }
+
+        /**
+         * Tiny JSON, gigantic plain form: quoting such an amount with toPlainString() built a string of a billion
+         * characters (OutOfMemoryError in the Kafka consumer). The message uses scientific notation instead.
+         */
+        @ParameterizedTest(name = "{0} -> {1}")
+        @CsvSource({
+                "1e999999999, amount must not exceed 1000000000.00 but was 1E+999999999",
+                "-1e999999999, amount must be positive but was -1E+999999999",
+                "1e-999999999, amount must have at most 2 decimals but was 1E-999999999",
+                "1e-3000000, amount must have at most 2 decimals but was 1E-3000000"
+        })
+        @DisplayName("an amount with an extreme exponent is rejected with a short message")
+        void rejectsExtremeExponentsWithAShortMessage(String amount, String expectedMessage) {
+            assertThatThrownBy(() -> bet(amount))
+                    .isInstanceOf(InvalidBetException.class)
+                    .hasMessage(expectedMessage);
         }
 
         @ParameterizedTest(name = "{0} -> {1}")

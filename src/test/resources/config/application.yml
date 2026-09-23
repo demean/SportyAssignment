@@ -1,13 +1,13 @@
 # Test-only overrides for EVERY test context (classpath:/config/application.yml wins over classpath:/application.yml).
 spring:
-  datasource:
-    # one isolated in-memory database per Spring test context: committed data never leaks between cached contexts
-    url: jdbc:h2:mem:test-${random.uuid};MODE=PostgreSQL;DATABASE_TO_LOWER=TRUE;DEFAULT_NULL_ORDERING=HIGH;DB_CLOSE_DELAY=-1;LOCK_TIMEOUT=3000
   kafka:
     # contexts without a broker start without touching Kafka; AbstractKafkaIntegrationTest turns both back on
     listener.auto-startup: false
     admin.auto-create: false
 jackpot:
+  # one isolated in-memory database per Spring test context (committed data never leaks between cached contexts);
+  # the rest of the shipped H2 URL (MODE, LOCK_TIMEOUT, ...) stays as it is, so the tests run the shipped settings
+  h2.database: test-${random.uuid}
   kafka:
     consumer.retry: { max-retries: 2, initial-interval: 10ms, multiplier: 2.0, max-interval: 50ms }
 logging:

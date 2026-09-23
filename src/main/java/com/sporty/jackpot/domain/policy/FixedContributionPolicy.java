@@ -6,12 +6,12 @@ import java.math.BigDecimal;
 /**
  * Every bet contributes a fixed percentage of its stake.
  *
- * @param percentage contribution percentage, {@code 0 <= percentage <= 100}
+ * @param percentage contribution percentage, {@code 0 < percentage <= 100}
  */
 public record FixedContributionPolicy(BigDecimal percentage) implements ContributionPolicy {
 
     public FixedContributionPolicy {
-        PolicyParameters.requirePercentage("percentage", percentage);
+        PolicyParameters.requirePositivePercentage("percentage", percentage);
     }
 
     @Override

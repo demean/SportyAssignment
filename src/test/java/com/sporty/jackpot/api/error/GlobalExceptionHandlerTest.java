@@ -12,7 +12,7 @@ import com.sporty.jackpot.api.ApiWebMvcTestConfiguration;
 import com.sporty.jackpot.api.controller.BetController;
 import com.sporty.jackpot.exception.ErrorCode;
 import com.sporty.jackpot.exception.JackpotConfigurationException;
-import com.sporty.jackpot.service.BetPublishingService;
+import com.sporty.jackpot.service.BetPlacementService;
 import com.sporty.jackpot.service.BetQueryService;
 import java.sql.SQLException;
 import java.util.stream.Stream;
@@ -63,7 +63,7 @@ class GlobalExceptionHandlerTest {
     private MockMvcTester mvc;
 
     @MockitoBean
-    private BetPublishingService publishingService;
+    private BetPlacementService placementService;
 
     @MockitoBean
     private BetQueryService queryService;

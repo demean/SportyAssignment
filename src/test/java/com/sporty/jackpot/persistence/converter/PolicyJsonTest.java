@@ -4,7 +4,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import com.sporty.jackpot.domain.policy.ContributionPolicy;
-import com.sporty.jackpot.domain.policy.FixedContributionPolicy;
+import com.sporty.jackpot.domain.policy.FixedChanceRewardPolicy;
 import com.sporty.jackpot.domain.policy.RewardPolicy;
 import java.math.BigDecimal;
 import java.util.Arrays;
@@ -61,15 +61,16 @@ class PolicyJsonTest {
     @MethodSource("plainDecimals")
     @DisplayName("writes BigDecimals in plain notation, never in scientific notation")
     void writesBigDecimalsAsPlainNumbers(String value, String expectedJsonNumber) {
-        String json = PolicyJson.MAPPER.writeValueAsString(new FixedContributionPolicy(new BigDecimal(value)));
+        String json = PolicyJson.MAPPER.writeValueAsString(new FixedChanceRewardPolicy(new BigDecimal(value)));
 
-        assertThat(json).isEqualTo("{\"type\":\"FIXED\",\"percentage\":" + expectedJsonNumber + "}");
+        assertThat(json).isEqualTo("{\"type\":\"FIXED\",\"chancePercentage\":" + expectedJsonNumber + "}");
     }
 
     static Stream<Arguments> plainDecimals() {
         return Stream.of(
                 Arguments.of("1E+1", "10"),
-                Arguments.of("5E-7", "0.0000005"),
+                // percentages have at most 4 decimals; zero keeps any scale (its toString would be 0E-7)
+                Arguments.of("0E-7", "0.0000000"),
                 Arguments.of("5.50", "5.50"));
     }
 

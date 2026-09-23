@@ -77,7 +77,7 @@ class VariableContributionPolicyTest {
         @Test
         @DisplayName("non-terminating step fractions are computed with DECIMAL64 and rounded to scale 4")
         void nonTerminatingDivision() {
-            VariableContributionPolicy thirds = policy("10", "0", "1", "3");
+            VariableContributionPolicy thirds = policy("10", "1", "1", "3");
 
             assertThat(thirds.contributionPercentage(BigDecimal.ONE, BigDecimal.ZERO)).isEqualTo(new BigDecimal("9.6667"));
             assertThat(thirds.contributionPercentage(new BigDecimal("2"), BigDecimal.ZERO))
@@ -103,14 +103,14 @@ class VariableContributionPolicyTest {
         }
 
         @Test
-        @DisplayName("a zero floor lets the percentage decay to 0 but never below")
-        void zeroFloor() {
-            VariableContributionPolicy toZero = policy("1", "0", "1", "100");
+        @DisplayName("the smallest floor (0.0001 %) is reached but never undercut: the percentage never decays to 0")
+        void smallestFloor() {
+            VariableContributionPolicy toFloor = policy("1", "0.0001", "1", "100");
 
-            assertThat(toZero.contributionPercentage(new BigDecimal("200.00"), LUCKY_INITIAL))
-                    .isEqualTo(new BigDecimal("0.0000"));
-            assertThat(toZero.contributionPercentage(new BigDecimal("900.00"), LUCKY_INITIAL))
-                    .isEqualTo(new BigDecimal("0.0000"));
+            assertThat(toFloor.contributionPercentage(new BigDecimal("200.00"), LUCKY_INITIAL))
+                    .isEqualTo(new BigDecimal("0.0001"));
+            assertThat(toFloor.contributionPercentage(new BigDecimal("1E+30"), LUCKY_INITIAL))
+                    .isEqualTo(new BigDecimal("0.0001"));
         }
     }
 
@@ -145,6 +145,12 @@ class VariableContributionPolicyTest {
                 "100.0001, 1, 0.5, 1000, 'startPercentage must be within [0, 100] but was 100.0001'",
                 "10, null, 0.5, 1000, minPercentage must not be null",
                 "10, -1, 0.5, 1000, 'minPercentage must be within [0, 100] but was -1'",
+                // a 0 % floor: once reached, every bet contributes 0.00, is never drawn and the jackpot is frozen
+                "10, 0, 0.5, 1000, 'minPercentage must be > 0 but was 0 (a 0 % contribution is never drawn, so the "
+                        + "jackpot could never be won)'",
+                "0, 0, 0, 1000, 'minPercentage must be > 0 but was 0 (a 0 % contribution is never drawn, so the "
+                        + "jackpot could never be won)'",
+                "0, 0.0001, 0, 1000, minPercentage (0.0001) must not exceed startPercentage (0)",
                 "100, 100.5, 0.5, 1000, 'minPercentage must be within [0, 100] but was 100.5'",
                 "5, 5.0001, 0.5, 1000, minPercentage (5.0001) must not exceed startPercentage (5)",
                 "10, 1, null, 1000, decayPercentage must not be null",
@@ -162,9 +168,9 @@ class VariableContributionPolicyTest {
 
         @ParameterizedTest(name = "start={0} min={1} decay={2} step={3}")
         @CsvSource({
-                "0, 0, 0, 0.01",
+                "0.0001, 0.0001, 0, 0.01",
                 "100, 100, 0, 1",
-                "100, 0, 100, 1E+9",
+                "100, 0.0001, 100, 1E+9",
                 "10.0, 10.0, 0.5, 1000"
         })
         void acceptsBoundaryParameters(BigDecimal start, BigDecimal min, BigDecimal decay, BigDecimal step) {

@@ -1,14 +1,20 @@
 package com.sporty.jackpot;
 
+import static com.tngtech.archunit.base.DescribedPredicate.alwaysTrue;
+import static com.tngtech.archunit.core.domain.JavaClass.Predicates.resideInAPackage;
 import static com.tngtech.archunit.lang.syntax.ArchRuleDefinition.classes;
 import static com.tngtech.archunit.lang.syntax.ArchRuleDefinition.methods;
 import static com.tngtech.archunit.lang.syntax.ArchRuleDefinition.noClasses;
 import static com.tngtech.archunit.lang.syntax.ArchRuleDefinition.noFields;
 import static com.tngtech.archunit.lang.syntax.ArchRuleDefinition.noMethods;
+import static com.tngtech.archunit.library.Architectures.layeredArchitecture;
+import static com.tngtech.archunit.library.dependencies.SlicesRuleDefinition.slices;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import com.sporty.jackpot.domain.policy.ContributionPolicy;
 import com.sporty.jackpot.domain.policy.RewardPolicy;
+import com.sporty.jackpot.persistence.repository.BetRepository;
+import com.tngtech.archunit.base.DescribedPredicate;
 import com.tngtech.archunit.core.domain.JavaClass;
 import com.tngtech.archunit.core.domain.JavaClasses;
 import com.tngtech.archunit.core.domain.JavaMethod;
@@ -22,15 +28,19 @@ import com.tngtech.archunit.lang.ConditionEvents;
 import com.tngtech.archunit.lang.EvaluationResult;
 import com.tngtech.archunit.lang.SimpleConditionEvent;
 import com.tngtech.archunit.library.GeneralCodingRules;
+import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.List;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.core.annotation.AnnotatedElementUtils;
 import org.springframework.http.ResponseEntity;
 import org.springframework.kafka.annotation.KafkaListener;
-import org.springframework.web.bind.annotation.RestController;
+import org.springframework.stereotype.Controller;
+import org.springframework.transaction.annotation.Isolation;
+import org.springframework.transaction.annotation.Transactional;
 
 /**
  * Layer rules of DESIGN.md section 3, checked against the main classes only.
@@ -47,6 +57,8 @@ class ArchitectureTest {
     private static final String ENTITY = BASE + ".persistence.entity..";
     private static final String API = BASE + ".api..";
     private static final String API_DTO = BASE + ".api.dto..";
+    private static final String CONFIG = BASE + ".config..";
+    private static final String REPOSITORY_PACKAGE = BASE + ".persistence.repository";
 
     private static final String SPRING_TRANSACTIONAL = "org.springframework.transaction.annotation.Transactional";
     private static final String JAKARTA_TRANSACTIONAL = "jakarta.transaction.Transactional";
@@ -95,12 +107,12 @@ class ArchitectureTest {
     }
 
     @Nested
-    @DisplayName("rule 3: REST controllers take and return DTOs only")
+    @DisplayName("rule 3: controllers (@RestController, or any other @Controller) take and return DTOs only")
     class ControllerSignatures {
 
         @Test
         void publicControllerMethodsUseOnlyDtoTypes() {
-            check(methods().that().areDeclaredInClassesThat().areAnnotatedWith(RestController.class)
+            check(methods().that().areDeclaredInClassesThat().areMetaAnnotatedWith(Controller.class)
                     .and().arePublic()
                     .should(useOnlyDtoTypesInTheirSignature())
                     .because("controllers must not leak domain objects or entities over HTTP"));
@@ -160,30 +172,49 @@ class ArchitectureTest {
         }
 
         @Test
-        @DisplayName("Kafka listeners and REST controllers are not transactional")
+        @DisplayName("Kafka listeners and controllers are not transactional")
         void listenersAndControllersAreNotTransactional() {
             check(noMethods().that().areAnnotatedWith(KafkaListener.class)
                     .should().beMetaAnnotatedWith(SPRING_TRANSACTIONAL)
                     .orShould().beMetaAnnotatedWith(JAKARTA_TRANSACTIONAL)
                     .because("each record must be applied in exactly one service transaction"));
-            check(noClasses().that().areAnnotatedWith(RestController.class)
+            check(noClasses().that().areMetaAnnotatedWith(Controller.class)
                     .should().beMetaAnnotatedWith(SPRING_TRANSACTIONAL)
                     .orShould().beMetaAnnotatedWith(JAKARTA_TRANSACTIONAL));
-            check(noMethods().that().areDeclaredInClassesThat().areAnnotatedWith(RestController.class)
+            check(noMethods().that().areDeclaredInClassesThat().areMetaAnnotatedWith(Controller.class)
                     .should().beMetaAnnotatedWith(SPRING_TRANSACTIONAL)
                     .orShould().beMetaAnnotatedWith(JAKARTA_TRANSACTIONAL));
         }
 
         @Test
-        @DisplayName("the services actually are transactional (the rules above are not vacuous)")
-        void servicesAreTransactional() {
-            assertThat(MAIN_CLASSES.stream()
-                    .filter(javaClass -> javaClass.getPackageName().startsWith(BASE + ".service"))
-                    .filter(javaClass -> javaClass.isMetaAnnotatedWith(SPRING_TRANSACTIONAL)
-                            || javaClass.getMethods().stream()
-                            .anyMatch(method -> method.isMetaAnnotatedWith(SPRING_TRANSACTIONAL)))
-                    .map(JavaClass::getSimpleName))
-                    .contains("BetProcessingService", "BetQueryService", "JackpotQueryService");
+        @DisplayName("every public method of a service owning a repository is transactional, writes READ_COMMITTED")
+        void repositoryOwningServicesAreTransactional() {
+            check(methods().that().arePublic()
+                    .and().areDeclaredInClassesThat().resideInAPackage(SERVICE)
+                    .and().areDeclaredInClassesThat(ownARepository())
+                    .should(runInATransaction())
+                    .because("every DB-touching service method runs in exactly one transaction (DESIGN 1.2); a "
+                            + "method without one would commit every repository call on its own"));
+        }
+
+        @Test
+        @DisplayName("the transaction check itself flags missing transactions and non-READ_COMMITTED writes")
+        void transactionCheckRejectsViolations() {
+            JavaClasses fixtures = new ClassFileImporter().importClasses(TransactionFixture.class,
+                    TransactionalFixture.class, RepositoryFreeFixture.class);
+
+            EvaluationResult result = methods().that().arePublic()
+                    .and().areDeclaredInClassesThat(ownARepository())
+                    .should(runInATransaction())
+                    .evaluate(fixtures);
+
+            assertThat(result.getFailureReport().getDetails())
+                    .anyMatch(detail -> detail.contains(".notTransactional(") && detail.contains("no transaction"))
+                    .anyMatch(detail -> detail.contains(".defaultIsolationWrite(") && detail.contains("DEFAULT"))
+                    .noneMatch(detail -> detail.contains(".readCommittedWrite("))
+                    .noneMatch(detail -> detail.contains(".readOnlyQuery("))
+                    .noneMatch(detail -> detail.contains(".readOnlyViaClass("))
+                    .noneMatch(detail -> detail.contains("RepositoryFreeFixture"));
         }
     }
 
@@ -200,6 +231,39 @@ class ArchitectureTest {
         @Test
         void noFieldInjectionAtAll() {
             check(GeneralCodingRules.NO_CLASSES_SHOULD_USE_FIELD_INJECTION);
+        }
+    }
+
+    @Nested
+    @DisplayName("rule 7: layers use only the layers below them (README section 5)")
+    class Layers {
+
+        @Test
+        @DisplayName("api and messaging are adapters around service -> persistence -> domain -> exception; config "
+                + "wires everything")
+        void layersUseOnlyTheLayersBelow() {
+            check(layeredArchitecture().consideringOnlyDependenciesInLayers()
+                    .layer("Api").definedBy(API)
+                    .layer("Messaging").definedBy(MESSAGING)
+                    .layer("Service").definedBy(SERVICE)
+                    .layer("Persistence").definedBy(PERSISTENCE)
+                    .layer("Domain").definedBy(DOMAIN)
+                    .layer("Exception").definedBy(EXCEPTION)
+                    .layer("Config").definedBy(CONFIG)
+                    // the HTTP adapter drives use cases through services only, never another adapter (Kafka)
+                    .whereLayer("Api").mayOnlyAccessLayers("Service", "Domain", "Exception")
+                    .whereLayer("Messaging").mayOnlyAccessLayers("Service", "Domain", "Exception", "Config")
+                    .whereLayer("Service").mayOnlyAccessLayers("Persistence", "Domain", "Exception")
+                    .whereLayer("Persistence").mayOnlyAccessLayers("Domain", "Exception")
+                    .whereLayer("Domain").mayOnlyAccessLayers("Exception")
+                    .whereLayer("Exception").mayNotAccessAnyLayer());
+        }
+
+        @Test
+        @DisplayName("no package cycles (config, the composition root, may depend on anything)")
+        void noPackageCycles() {
+            check(slices().matching(BASE + ".(*)..").should().beFreeOfCycles()
+                    .ignoreDependency(resideInAPackage(CONFIG), alwaysTrue()));
         }
     }
 
@@ -266,6 +330,90 @@ class ArchitectureTest {
                     .allMatch(ArchitectureTest::isDtoOrContainerOfDtos);
         }
         return rawType.getPackageName().equals(BASE + ".api.dto");
+    }
+
+    /** Classes with a field whose type is a Spring Data repository, i.e. classes that touch the database. */
+    private static DescribedPredicate<JavaClass> ownARepository() {
+        return DescribedPredicate.describe("own a repository", javaClass -> javaClass.getFields().stream()
+                .anyMatch(field -> field.getRawType().getPackageName().equals(REPOSITORY_PACKAGE)));
+    }
+
+    /**
+     * {@code @Transactional} on the method or its class; read-write transactions must pin {@code READ_COMMITTED}
+     * (the isolation the row-lock design relies on).
+     */
+    private static ArchCondition<JavaMethod> runInATransaction() {
+        return new ArchCondition<>("run in a transaction, READ_COMMITTED unless read-only") {
+            @Override
+            public void check(JavaMethod method, ConditionEvents events) {
+                Method reflected = method.reflect();
+                Transactional transactional = AnnotatedElementUtils.findMergedAnnotation(reflected, Transactional.class);
+                if (transactional == null) {
+                    transactional = AnnotatedElementUtils.findMergedAnnotation(reflected.getDeclaringClass(),
+                            Transactional.class);
+                }
+                if (transactional == null) {
+                    events.add(SimpleConditionEvent.violated(method, method.getFullName()
+                            + " runs in no transaction in " + method.getSourceCodeLocation()));
+                } else if (!transactional.readOnly() && transactional.isolation() != Isolation.READ_COMMITTED) {
+                    events.add(SimpleConditionEvent.violated(method, method.getFullName() + " writes with isolation "
+                            + transactional.isolation() + " instead of READ_COMMITTED in "
+                            + method.getSourceCodeLocation()));
+                }
+            }
+        };
+    }
+
+    /** Fixture for the negative test of the transaction condition: owns a repository, mixed methods. */
+    static class TransactionFixture {
+
+        private final BetRepository repository;
+
+        TransactionFixture(BetRepository repository) {
+            this.repository = repository;
+        }
+
+        public boolean notTransactional() {
+            return repository.existsById("bet-1");
+        }
+
+        @Transactional
+        public boolean defaultIsolationWrite() {
+            return repository.existsById("bet-1");
+        }
+
+        @Transactional(isolation = Isolation.READ_COMMITTED)
+        public boolean readCommittedWrite() {
+            return repository.existsById("bet-1");
+        }
+
+        @Transactional(readOnly = true)
+        public boolean readOnlyQuery() {
+            return repository.existsById("bet-1");
+        }
+    }
+
+    /** Fixture: read-only transactional at class level. */
+    @Transactional(readOnly = true)
+    static class TransactionalFixture {
+
+        private final BetRepository repository;
+
+        TransactionalFixture(BetRepository repository) {
+            this.repository = repository;
+        }
+
+        public boolean readOnlyViaClass() {
+            return repository.existsById("bet-1");
+        }
+    }
+
+    /** Fixture: owns no repository, so it needs no transaction. */
+    static class RepositoryFreeFixture {
+
+        public boolean noDatabase() {
+            return true;
+        }
     }
 
     /**

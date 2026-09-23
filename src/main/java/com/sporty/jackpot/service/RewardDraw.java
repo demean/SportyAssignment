@@ -29,8 +29,7 @@ public class RewardDraw {
      */
     public boolean isWinning(BigDecimal chancePercentage) {
         if (chancePercentage.signum() < 0 || chancePercentage.compareTo(Money.HUNDRED) > 0) {
-            throw new IllegalArgumentException("chancePercentage must be within [0, 100] but was "
-                    + chancePercentage.toPlainString());
+            throw new IllegalArgumentException("chancePercentage must be within [0, 100] but was " + chancePercentage);
         }
         long threshold = chancePercentage.setScale(Money.PERCENT_SCALE, Money.ROUNDING)
                 .movePointRight(Money.PERCENT_SCALE)

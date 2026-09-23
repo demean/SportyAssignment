@@ -3,8 +3,9 @@ package com.sporty.jackpot.domain.policy;
 import java.math.BigDecimal;
 
 /**
- * How likely a contributing bet wins the jackpot. Sealed: adding a policy fails compilation until every exhaustive
- * {@code switch} (API mapping, JSON subtypes) handles it.
+ * How likely a contributing bet wins the jackpot. Sealed: adding a policy fails compilation until the exhaustive
+ * {@code switch} in the API mapping handles it; {@code PolicyJsonTest} fails until its JSON subtype is registered in
+ * {@code PolicyJson}.
  */
 public sealed interface RewardPolicy permits FixedChanceRewardPolicy, VariableChanceRewardPolicy {
 

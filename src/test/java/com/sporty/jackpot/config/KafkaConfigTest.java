@@ -12,9 +12,12 @@ import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+import ch.qos.logback.classic.Level;
 import com.sporty.jackpot.exception.InvalidBetException;
 import com.sporty.jackpot.exception.JackpotConfigurationException;
 import com.sporty.jackpot.messaging.BetPlacedEvent;
+import com.sporty.jackpot.messaging.BetPlacedEventDeserializer;
+import com.sporty.jackpot.support.LogCapture;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
@@ -32,6 +35,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BiFunction;
 import java.util.stream.Stream;
@@ -43,6 +47,7 @@ import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.clients.producer.RecordMetadata;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.errors.NotEnoughReplicasException;
+import org.apache.kafka.common.errors.RecordTooLargeException;
 import org.apache.kafka.common.errors.SerializationException;
 import org.apache.kafka.common.header.internals.RecordHeaders;
 import org.apache.kafka.common.serialization.Serializer;
@@ -71,17 +76,18 @@ import org.springframework.kafka.config.ConcurrentKafkaListenerContainerFactory;
 import org.springframework.kafka.core.ConsumerFactory;
 import org.springframework.kafka.core.DefaultKafkaProducerFactory;
 import org.springframework.kafka.core.KafkaOperations;
+import org.springframework.kafka.core.KafkaProducerException;
 import org.springframework.kafka.listener.CommonErrorHandler;
 import org.springframework.kafka.listener.ConcurrentMessageListenerContainer;
 import org.springframework.kafka.listener.ConsumerRecordRecoverer;
 import org.springframework.kafka.listener.ContainerProperties;
+import org.springframework.kafka.listener.DeadLetterPublishingRecoverer;
 import org.springframework.kafka.listener.ListenerExecutionFailedException;
 import org.springframework.kafka.listener.MessageListenerContainer;
 import org.springframework.kafka.support.KafkaHeaders;
 import org.springframework.kafka.support.SendResult;
 import org.springframework.kafka.support.serializer.DelegatingByTypeSerializer;
 import org.springframework.kafka.support.serializer.DeserializationException;
-import org.springframework.kafka.support.serializer.JacksonJsonDeserializer;
 import org.springframework.kafka.support.serializer.JacksonJsonSerializer;
 import org.springframework.orm.jpa.JpaSystemException;
 import org.springframework.transaction.CannotCreateTransactionException;
@@ -94,6 +100,7 @@ class KafkaConfigTest {
     private static final String BETS_TOPIC = "bets";
     private static final String DEAD_LETTER_TOPIC = "bets.DLT";
     private static final String DEAD_LETTERED = "jackpot.bets.dead-lettered";
+    private static final String DEAD_LETTER_FAILED = "jackpot.bets.dead-letter-failed";
     private static final int MAX_RETRIES = 2;
     private static final Instant PLACED_AT = Instant.parse("2026-09-23T10:15:30.123456Z");
     private static final BetPlacedEvent EVENT =
@@ -253,8 +260,8 @@ class KafkaConfigTest {
             assertThat(new String(json, StandardCharsets.UTF_8))
                     .contains("\"betAmount\":10.50")
                     .contains("\"placedAt\":\"2026-09-23T10:15:30.123456Z\"");
-            try (JacksonJsonDeserializer<BetPlacedEvent> deserializer =
-                         new JacksonJsonDeserializer<>(BetPlacedEvent.class, false)) {
+            // the consumer's strict value delegate reads it back unchanged
+            try (BetPlacedEventDeserializer deserializer = new BetPlacedEventDeserializer()) {
                 BetPlacedEvent roundTripped = deserializer.deserialize(BETS_TOPIC, json);
                 assertThat(roundTripped).isEqualTo(EVENT);
                 assertThat(roundTripped.betAmount().scale()).isEqualTo(2);
@@ -471,6 +478,26 @@ class KafkaConfigTest {
         }
 
         @Test
+        @DisplayName("a dead-letter send failing synchronously keeps its cause, and is retried like any failure")
+        void synchronousDeadLetterSendFailureKeepsItsCause() {
+            IllegalStateException producerClosed = new IllegalStateException("Cannot send after the producer is closed");
+            when(kafkaOperations.send(anyProducerRecord())).thenThrow(producerClosed);
+            Exception failure = listenerFailure(new InvalidBetException("bad bet"));
+
+            assertThatThrownBy(() -> deliver(failure)).hasMessage("Record in retry and not yet recovered");
+
+            verify(consumer).seek(new TopicPartition(BETS_TOPIC, 7), 17L);
+            assertThat(meterRegistry.find(DEAD_LETTERED).counter()).isNull();
+            assertThat(meterRegistry.find(DEAD_LETTER_FAILED).counter()).isNull();
+            DeadLetterPublishingRecoverer publisher =
+                    new KafkaConfig.DeadLetterPublisher(kafkaOperations, KafkaConfig.deadLetterDestination("dlt"));
+            assertThatThrownBy(() -> publisher.accept(failedRecord, failure))
+                    .isInstanceOf(KafkaException.class)
+                    .hasMessage("Dead-letter publication to dlt failed for: bets-7@17")
+                    .hasCause(producerClosed);
+        }
+
+        @Test
         @DisplayName("a failed dead-letter publication re-seeks the record and is not counted as dead-lettered")
         void failedDeadLetterPublicationKeepsTheRecord() {
             when(kafkaOperations.send(anyProducerRecord()))
@@ -482,6 +509,40 @@ class KafkaConfigTest {
 
             verify(consumer, times(2)).seek(new TopicPartition(BETS_TOPIC, 7), 17L);
             verify(kafkaOperations, times(2)).send(anyProducerRecord());
+            assertThat(meterRegistry.find(DEAD_LETTERED).counter()).isNull();
+        }
+
+        /**
+         * The producer rejects a record over {@code max.request.size} before sending: KafkaTemplate then throws
+         * synchronously; the broker's own size check fails the future instead.
+         */
+        static Stream<Arguments> oversizedDeadLetterFailures() {
+            RecordTooLargeException tooLarge = new RecordTooLargeException("The message is 1050187 bytes when "
+                    + "serialized which is larger than 1048576");
+            return Stream.of(
+                    Arguments.of("rejected by the producer (synchronous)", false,
+                            new KafkaException("Send failed", tooLarge)),
+                    Arguments.of("rejected by the broker (failed future)", true, tooLarge));
+        }
+
+        @ParameterizedTest(name = "{0}")
+        @MethodSource("oversizedDeadLetterFailures")
+        @DisplayName("a dead-letter record too large to publish is acknowledged once, never retried (no endless loop)")
+        void oversizedDeadLetterRecordIsNotRetried(String description, boolean asFailedFuture,
+                                                   RuntimeException sendFailure) {
+            if (asFailedFuture) {
+                when(kafkaOperations.send(anyProducerRecord())).thenReturn(CompletableFuture.failedFuture(sendFailure));
+            } else {
+                when(kafkaOperations.send(anyProducerRecord())).thenThrow(sendFailure);
+            }
+            Exception failure = listenerFailure(new InvalidBetException("bad bet"));
+
+            assertThatCode(() -> deliver(failure)).doesNotThrowAnyException();
+
+            verify(consumer, never()).seek(any(TopicPartition.class), anyLong());
+            verify(kafkaOperations).send(anyProducerRecord());
+            assertThat(meterRegistry.get(DEAD_LETTER_FAILED).tag("exception", "InvalidBetException").counter()
+                    .count()).isEqualTo(1.0);
             assertThat(meterRegistry.find(DEAD_LETTERED).counter()).isNull();
         }
     }
@@ -595,6 +656,52 @@ class KafkaConfigTest {
             assertThatThrownBy(() -> recoverer.accept(betRecord(), new IllegalStateException("boom")))
                     .isSameAs(publishFailure);
             assertThat(meterRegistry.find(DEAD_LETTERED).counter()).isNull();
+        }
+
+        @Test
+        @DisplayName("counting recoverer: a dead-letter record too large to publish is logged, counted and skipped")
+        void countingRecovererSkipsOversizedDeadLetterRecords() {
+            SimpleMeterRegistry meterRegistry = new SimpleMeterRegistry();
+            ConsumerRecordRecoverer delegate = mock(ConsumerRecordRecoverer.class);
+            doThrow(new KafkaException("Dead-letter publication to bets.DLT failed for: bets-7@17",
+                    new ExecutionException(new KafkaProducerException(new ProducerRecord<>(DEAD_LETTER_TOPIC, "v"),
+                            "Failed to send", new RecordTooLargeException("The message is 1055445 bytes")))))
+                    .when(delegate).accept(any(), any());
+            ConsumerRecordRecoverer recoverer = KafkaConfig.countingRecoverer(delegate, meterRegistry);
+
+            try (LogCapture logs = LogCapture.of(KafkaConfig.class)) {
+                assertThatCode(() -> recoverer.accept(betRecord(), listenerFailure(new InvalidBetException("bad"))))
+                        .doesNotThrowAnyException();
+
+                assertThat(logs.messages(Level.ERROR)).containsExactly(
+                        "Dead-lettering record bets-7@17 (key=jackpot-1): "
+                                + "com.sporty.jackpot.exception.InvalidBetException: bad",
+                        "Record bets-7@17 (key=jackpot-1) was NOT dead-lettered: the dead-letter record is too large "
+                                + "to publish. The record is acknowledged; replay it from that topic, partition and "
+                                + "offset");
+            }
+            assertThat(meterRegistry.get(DEAD_LETTER_FAILED).tag("exception", "InvalidBetException").counter().count())
+                    .isEqualTo(1.0);
+            assertThat(meterRegistry.find(DEAD_LETTERED).counter()).isNull();
+        }
+
+        @Test
+        @DisplayName("counting recoverer: the logged key and failure are cut to 500 characters (untrusted input)")
+        void countingRecovererBoundsTheLogLine() {
+            ConsumerRecordRecoverer recoverer = KafkaConfig.countingRecoverer(mock(ConsumerRecordRecoverer.class),
+                    new SimpleMeterRegistry());
+            ConsumerRecord<String, BetPlacedEvent> hugeKey = new ConsumerRecord<>(BETS_TOPIC, 7, 17L,
+                    "k".repeat(1_000_000), EVENT);
+
+            try (LogCapture logs = LogCapture.of(KafkaConfig.class)) {
+                recoverer.accept(hugeKey, listenerFailure(new IllegalStateException("x".repeat(1_000_000))));
+
+                assertThat(logs.messages(Level.ERROR)).singleElement().asString()
+                        .hasSizeLessThan(2 * KafkaConfig.MAX_LOGGED_LENGTH + 100)
+                        .startsWith("Dead-lettering record bets-7@17 (key=" + "k".repeat(KafkaConfig.MAX_LOGGED_LENGTH))
+                        .contains("java.lang.IllegalStateException: xxx")
+                        .endsWith(" (truncated)...");
+            }
         }
 
         private static Counter counter(SimpleMeterRegistry registry, String exception) {

@@ -5,7 +5,6 @@ import com.sporty.jackpot.api.dto.BetEvaluationResponse;
 import com.sporty.jackpot.api.dto.BetResponse;
 import com.sporty.jackpot.api.dto.ContributionResponse;
 import com.sporty.jackpot.api.dto.JackpotResponse;
-import com.sporty.jackpot.api.dto.PlaceBetRequest;
 import com.sporty.jackpot.api.dto.PolicyResponse;
 import com.sporty.jackpot.domain.model.Bet;
 import com.sporty.jackpot.domain.model.BetEvaluation;
@@ -19,15 +18,14 @@ import com.sporty.jackpot.domain.policy.RewardPolicy;
 import com.sporty.jackpot.domain.policy.VariableChanceRewardPolicy;
 import com.sporty.jackpot.domain.policy.VariableContributionPolicy;
 import java.math.BigDecimal;
-import java.time.Instant;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import org.springframework.stereotype.Component;
 
 /**
- * Maps between API DTOs and the domain model. The policy switches are exhaustive over the sealed hierarchies, so a
- * new policy type fails compilation until it is mapped here.
+ * Maps the domain model (the bets and read models the services return) to API response DTOs. The policy switches
+ * are exhaustive over the sealed hierarchies, so a new policy type fails compilation until it is mapped here.
  */
 @Component
 public class ApiMapper {
@@ -36,12 +34,9 @@ public class ApiMapper {
     static final String FIXED = "FIXED";
     static final String VARIABLE = "VARIABLE";
 
-    public Bet toBet(PlaceBetRequest request, Instant placedAt) {
-        return new Bet(request.betId(), request.userId(), request.jackpotId(), request.betAmount(), placedAt);
-    }
-
-    public BetAcceptedResponse toAcceptedResponse(Bet bet, Instant acceptedAt) {
-        return new BetAcceptedResponse(bet.betId(), bet.jackpotId(), ACCEPTED, acceptedAt);
+    /** {@code acceptedAt} is the time the bet was accepted, i.e. its {@link Bet#placedAt()}. */
+    public BetAcceptedResponse toAcceptedResponse(Bet bet) {
+        return new BetAcceptedResponse(bet.betId(), bet.jackpotId(), ACCEPTED, bet.placedAt());
     }
 
     public BetResponse toResponse(ProcessedBet bet) {

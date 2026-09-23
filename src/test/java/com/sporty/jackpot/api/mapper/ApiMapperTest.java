@@ -11,7 +11,6 @@ import com.sporty.jackpot.api.dto.BetEvaluationResponse;
 import com.sporty.jackpot.api.dto.BetResponse;
 import com.sporty.jackpot.api.dto.ContributionResponse;
 import com.sporty.jackpot.api.dto.JackpotResponse;
-import com.sporty.jackpot.api.dto.PlaceBetRequest;
 import com.sporty.jackpot.api.dto.PolicyResponse;
 import com.sporty.jackpot.domain.model.Bet;
 import com.sporty.jackpot.domain.model.BetEvaluation;
@@ -26,7 +25,6 @@ import com.sporty.jackpot.domain.policy.FixedContributionPolicy;
 import com.sporty.jackpot.domain.policy.RewardPolicy;
 import com.sporty.jackpot.domain.policy.VariableChanceRewardPolicy;
 import com.sporty.jackpot.domain.policy.VariableContributionPolicy;
-import com.sporty.jackpot.exception.InvalidBetException;
 import java.math.BigDecimal;
 import java.time.Instant;
 import java.util.Arrays;
@@ -57,41 +55,17 @@ class ApiMapperTest {
     private final ApiMapper mapper = new ApiMapper();
 
     @Nested
-    @DisplayName("requests and acknowledgements")
-    class Requests {
+    @DisplayName("acknowledgements")
+    class Acknowledgements {
 
         @Test
-        @DisplayName("toBet builds the domain bet with the given placedAt and the amount normalized to scale 2")
-        void mapsRequestToBet() {
-            PlaceBetRequest request = new PlaceBetRequest("bet-1", "user-1", "jackpot-1", new BigDecimal("12.5"));
-
-            Bet bet = mapper.toBet(request, PLACED_AT);
-
-            assertThat(bet.betId()).isEqualTo("bet-1");
-            assertThat(bet.userId()).isEqualTo("user-1");
-            assertThat(bet.jackpotId()).isEqualTo("jackpot-1");
-            assertThat(bet.amount()).isEqualByComparingTo("12.50").hasScaleOf(2);
-            assertThat(bet.placedAt()).isEqualTo(PLACED_AT);
-        }
-
-        @Test
-        @DisplayName("toBet enforces the domain invariants even when bean validation was bypassed")
-        void rejectsInvalidRequest() {
-            PlaceBetRequest request = new PlaceBetRequest("bet-1", "user-1", "jackpot-1", new BigDecimal("0.001"));
-
-            assertThatThrownBy(() -> mapper.toBet(request, PLACED_AT))
-                    .isInstanceOf(InvalidBetException.class)
-                    .hasMessageContaining("amount");
-        }
-
-        @Test
-        @DisplayName("toAcceptedResponse reports status ACCEPTED with the acknowledgement instant")
+        @DisplayName("toAcceptedResponse reports status ACCEPTED with the bet's placedAt as acceptedAt")
         void mapsAcceptedResponse() {
             Bet bet = new Bet("bet-1", "user-1", "jackpot-1", new BigDecimal("10.00"), PLACED_AT);
 
-            BetAcceptedResponse response = mapper.toAcceptedResponse(bet, LATER);
+            BetAcceptedResponse response = mapper.toAcceptedResponse(bet);
 
-            assertThat(response).isEqualTo(new BetAcceptedResponse("bet-1", "jackpot-1", "ACCEPTED", LATER));
+            assertThat(response).isEqualTo(new BetAcceptedResponse("bet-1", "jackpot-1", "ACCEPTED", PLACED_AT));
         }
     }
 

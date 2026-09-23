@@ -37,7 +37,8 @@ import org.springframework.transaction.support.TransactionTemplate;
 
 /**
  * Row locking of {@link JackpotRepository#findByIdForUpdate} with real concurrent transactions (the test itself runs
- * without a transaction, every repository call commits). The test URL sets {@code LOCK_TIMEOUT=3000}.
+ * without a transaction, every repository call commits). The lock wait is the shipped H2 URL's
+ * {@code LOCK_TIMEOUT=3000} (the tests only rename the in-memory database).
  */
 @DataJpaTest
 @AutoConfigureTestDatabase(replace = AutoConfigureTestDatabase.Replace.NONE)

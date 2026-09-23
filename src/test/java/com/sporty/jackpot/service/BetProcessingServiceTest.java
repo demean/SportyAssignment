@@ -25,6 +25,7 @@ import com.sporty.jackpot.domain.policy.FixedContributionPolicy;
 import com.sporty.jackpot.domain.policy.RewardPolicy;
 import com.sporty.jackpot.domain.policy.VariableChanceRewardPolicy;
 import com.sporty.jackpot.domain.policy.VariableContributionPolicy;
+import com.sporty.jackpot.exception.JackpotConfigurationException;
 import com.sporty.jackpot.persistence.entity.BetEntity;
 import com.sporty.jackpot.persistence.entity.BetEvaluationEntity;
 import com.sporty.jackpot.persistence.entity.JackpotContributionEntity;
@@ -37,6 +38,7 @@ import com.sporty.jackpot.persistence.repository.JackpotContributionRepository;
 import com.sporty.jackpot.persistence.repository.JackpotRepository;
 import com.sporty.jackpot.persistence.repository.JackpotRewardRepository;
 import com.sporty.jackpot.service.event.BetProcessedEvent;
+import com.sporty.jackpot.support.LogCapture;
 import com.sporty.jackpot.support.StubRandomGenerator;
 import java.math.BigDecimal;
 import java.time.Clock;
@@ -241,7 +243,7 @@ class BetProcessingServiceTest {
         void samePayloadIsIgnored() {
             givenStoredBet(USER_ID, JACKPOT_ID, "25.5", Optional.of(jackpot));
 
-            try (ServiceLogCapture logs = ServiceLogCapture.of(BetProcessingService.class)) {
+            try (LogCapture logs = LogCapture.of(BetProcessingService.class)) {
                 ProcessingResult result = service.process(bet("25.50"));
 
                 assertThat(result).isEqualTo(ProcessingResult.duplicate(BET_ID));
@@ -265,7 +267,7 @@ class BetProcessingServiceTest {
         void differentPayloadIsIgnoredWithWarning(String storedUserId, String storedJackpotId, String storedAmount) {
             givenStoredBet(storedUserId, storedJackpotId, storedAmount, Optional.of(jackpot));
 
-            try (ServiceLogCapture logs = ServiceLogCapture.of(BetProcessingService.class)) {
+            try (LogCapture logs = LogCapture.of(BetProcessingService.class)) {
                 ProcessingResult result = service.process(bet("25.50"));
 
                 assertThat(result).isEqualTo(ProcessingResult.duplicate(BET_ID));
@@ -355,9 +357,10 @@ class BetProcessingServiceTest {
 
         @ParameterizedTest(name = "{0} % of {1} rounds to 0.00 -> LOST without a draw")
         @CsvSource({
-                "0, 250.00",
+                // a 0 % contribution is rejected when the policy is built: only rounding can yield 0.00
                 "5, 0.09",
-                "1, 0.49"
+                "1, 0.49",
+                "0.0001, 5000.00"
         })
         @DisplayName("a zero contribution is LOST with chance 0 and never drawn, even on a 100 % jackpot")
         void zeroContributionIsLostWithoutDraw(String percentage, String stake) {
@@ -478,6 +481,34 @@ class BetProcessingServiceTest {
             assertThat(jackpot.getCurrentPoolAmount()).isEqualByComparingTo("100.00");
             assertThat(jackpot.getCycle()).isEqualTo(2);
             assertThat(highestDraw.remaining()).as("drawn exactly once").isZero();
+        }
+    }
+
+    @Nested
+    @DisplayName("misconfigured jackpot (T8)")
+    class MisconfiguredJackpot {
+
+        @ParameterizedTest(name = "poolLimit {0} with initial pool 100.00")
+        @ValueSource(strings = {"100", "50"})
+        @DisplayName("a pool limit not above the initial pool is rejected before anything is written or drawn")
+        void poolLimitNotAboveTheInitialPoolIsRejected(String poolLimit) {
+            // unchecked, every bet would see chance 100 % (pool >= limit) and win the whole pool
+            JackpotEntity jackpot = jackpot("100.00", "100.00", 1, fixedContribution("5"),
+                    new VariableChanceRewardPolicy(new BigDecimal("0"), new BigDecimal("0"), new BigDecimal("10"),
+                            new BigDecimal(poolLimit)));
+            when(jackpotRepository.findByIdForUpdate(JACKPOT_ID)).thenReturn(Optional.of(jackpot));
+            when(betRepository.findById(BET_ID)).thenReturn(Optional.empty());
+
+            assertThatThrownBy(() -> service.process(bet("20.00")))
+                    .isInstanceOf(JackpotConfigurationException.class)
+                    .hasMessage("Jackpot '" + JACKPOT_ID + "' is misconfigured: poolLimit (" + poolLimit
+                            + ") must be greater than the initial pool (100.00)");
+
+            verify(betRepository, never()).saveAndFlush(any());
+            verifyNoInteractions(contributionRepository, rewardRepository, evaluationRepository, rewardDraw,
+                    eventPublisher);
+            assertThat(jackpot.getCurrentPoolAmount()).as("pool untouched").isEqualByComparingTo("100.00");
+            assertThat(jackpot.getCycle()).isEqualTo(1);
         }
     }
 

@@ -4,14 +4,23 @@ import static com.sporty.jackpot.support.TestJackpots.fixedChance;
 import static com.sporty.jackpot.support.TestJackpots.fixedContribution;
 import static org.assertj.core.api.Assertions.assertThat;
 
+import com.jayway.jsonpath.DocumentContext;
+import com.jayway.jsonpath.JsonPath;
+import com.sporty.jackpot.exception.ErrorCode;
 import com.sporty.jackpot.messaging.BetPlacedEvent;
+import com.sporty.jackpot.messaging.BetPlacedEventDeserializer;
+import com.zaxxer.hikari.HikariDataSource;
 import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
+import java.sql.SQLException;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
+import javax.sql.DataSource;
 import org.apache.kafka.clients.admin.AdminClient;
 import org.apache.kafka.clients.admin.Config;
 import org.apache.kafka.clients.admin.TopicDescription;
@@ -30,7 +39,9 @@ import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.ApplicationContext;
 import org.springframework.core.task.SimpleAsyncTaskExecutor;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
 import org.springframework.kafka.core.ConsumerFactory;
 import org.springframework.kafka.core.DefaultKafkaProducerFactory;
 import org.springframework.kafka.core.KafkaAdmin;
@@ -66,6 +77,9 @@ class RuntimeWiringIntegrationTest extends AbstractEndToEndIntegrationTest {
 
     @Autowired
     private ApplicationContext applicationContext;
+
+    @Autowired
+    private DataSource dataSource;
 
     @Test
     @DisplayName("the producer used by the API is idempotent, waits for all replicas and gives up before the API does")
@@ -107,7 +121,7 @@ class RuntimeWiringIntegrationTest extends AbstractEndToEndIntegrationTest {
     }
 
     @Test
-    @DisplayName("the consumer reads JSON without type headers behind error-handling deserializers")
+    @DisplayName("the consumer reads strict JSON without type headers behind error-handling deserializers")
     void consumerIsConfiguredForPoisonPillSafeJson() {
         Map<String, Object> config = consumerFactory.getConfigurationProperties();
 
@@ -120,7 +134,7 @@ class RuntimeWiringIntegrationTest extends AbstractEndToEndIntegrationTest {
         assertThat(config).containsEntry(ErrorHandlingDeserializer.KEY_DESERIALIZER_CLASS,
                         StringDeserializer.class.getName())
                 .containsEntry(ErrorHandlingDeserializer.VALUE_DESERIALIZER_CLASS,
-                        JacksonJsonDeserializer.class.getName())
+                        BetPlacedEventDeserializer.class.getName())
                 .containsEntry(JacksonJsonDeserializer.VALUE_DEFAULT_TYPE, BetPlacedEvent.class.getName())
                 .containsEntry(JacksonJsonDeserializer.USE_TYPE_INFO_HEADERS, "false")
                 .containsEntry(JacksonJsonDeserializer.TRUSTED_PACKAGES, "com.sporty.jackpot.messaging")
@@ -204,6 +218,38 @@ class RuntimeWiringIntegrationTest extends AbstractEndToEndIntegrationTest {
     }
 
     @Test
+    @DisplayName("a stopped listener container fails liveness (a restart heals it); readiness stays UP")
+    void stoppedListenerContainerFailsLiveness() {
+        MessageListenerContainer container = listenerRegistry.getListenerContainers().iterator().next();
+        try {
+            container.stop();
+
+            MvcTestResult liveness = mvc.get().uri("/actuator/health/liveness").exchange();
+            assertThat(liveness).hasStatus(HttpStatus.SERVICE_UNAVAILABLE);
+            assertThat(text(liveness, "$.status")).isEqualTo("DOWN");
+            MvcTestResult readiness = mvc.get().uri("/actuator/health/readiness").exchange();
+            assertThat(readiness).as("the HTTP API still works: keep serving it").hasStatusOk();
+            assertThat(text(readiness, "$.status")).isEqualTo("UP");
+        } finally {
+            container.start();
+            waitForAssignment();
+        }
+        assertThat(mvc.get().uri("/actuator/health/liveness").exchange()).hasStatusOk();
+    }
+
+    @Test
+    @DisplayName("the shipped H2 URL and connection pool are in effect (T17): only the database name is per test")
+    void shippedDataSourceSettings() throws SQLException {
+        HikariDataSource hikari = dataSource.unwrap(HikariDataSource.class);
+
+        assertThat(hikari.getConnectionTimeout()).isEqualTo(2_000L);
+        assertThat(hikari.getMaximumPoolSize()).isEqualTo(10);
+        assertThat(hikari.getJdbcUrl()).startsWith("jdbc:h2:mem:test-")
+                .endsWith(";MODE=PostgreSQL;DATABASE_TO_LOWER=TRUE;DEFAULT_NULL_ORDERING=HIGH;DB_CLOSE_DELAY=-1;"
+                        + "LOCK_TIMEOUT=3000");
+    }
+
+    @Test
     @DisplayName("Prometheus exposes the business metrics of a processed bet")
     void prometheusExposesTheBusinessMetrics() {
         String jackpotId = jackpots.create("1000.00", fixedContribution("5.0"), fixedChance("0"));
@@ -243,9 +289,49 @@ class RuntimeWiringIntegrationTest extends AbstractEndToEndIntegrationTest {
         assertThat(paths).containsOnlyKeys("/api/v1/bets", "/api/v1/bets/{betId}",
                 "/api/v1/bets/{betId}/contribution", "/api/v1/bets/{betId}/evaluation", "/api/v1/jackpots",
                 "/api/v1/jackpots/{jackpotId}");
-        assertThat(placeBetResponses).containsKeys("202", "400", "503");
-        assertThat(evaluationResponses).containsKeys("200", "404", "422");
+        assertThat(placeBetResponses).containsOnlyKeys("202", "400", "415", "503");
+        assertThat(evaluationResponses).containsOnlyKeys("200", "400", "404", "422", "503");
         assertThat(mvc.get().uri("/swagger-ui.html").exchange()).hasStatus3xxRedirection();
+    }
+
+    @Test
+    @DisplayName("OpenAPI documents every error response as application/problem+json with the Problem schema")
+    void openApiDocumentsErrorsAsProblemDetails() {
+        DocumentContext apiDocs = json(mvc.get().uri("/v3/api-docs").exchange());
+        List<Map<String, Map<String, Object>>> responsesPerOperation = apiDocs.read("$.paths.*.*.responses");
+        List<String> errorStatuses = new ArrayList<>();
+
+        assertThat(responsesPerOperation).as("one entry per operation").hasSize(6);
+        for (Map<String, Map<String, Object>> responses : responsesPerOperation) {
+            responses.forEach((status, response) -> {
+                Map<String, Object> content = JsonPath.read(response, "$.content");
+                if (status.startsWith("4") || status.startsWith("5")) {
+                    errorStatuses.add(status);
+                    assertThat(content).as(status).containsOnlyKeys(MediaType.APPLICATION_PROBLEM_JSON_VALUE);
+                    assertThat(JsonPath.<String>read(content, "$['application/problem+json'].schema.$ref"))
+                            .as(status).isEqualTo("#/components/schemas/Problem");
+                } else {
+                    assertThat(content).as(status).doesNotContainKey(MediaType.APPLICATION_PROBLEM_JSON_VALUE);
+                }
+            });
+        }
+        assertThat(errorStatuses).contains("400", "404", "415", "422", "503");
+        assertThat(apiDocs.read("$.components.schemas.Problem.properties.code.enum", List.class))
+                .containsExactlyElementsOf(Arrays.stream(ErrorCode.values()).map(Enum::name).toList());
+        assertThat(apiDocs.read("$.components.schemas.Problem.required", List.class))
+                .containsExactlyInAnyOrder("title", "status", "detail", "instance", "code", "timestamp");
+        assertThat(apiDocs.read("$.components.schemas.Problem.properties.errors.items.$ref", String.class))
+                .isEqualTo("#/components/schemas/FieldError");
+        assertThat(apiDocs.read("$.paths['/api/v1/bets'].post.responses['202'].headers", Map.class))
+                .containsKey(HttpHeaders.LOCATION);
+        assertThat(apiDocs.read("$.paths['/api/v1/bets'].post.responses['503'].headers", Map.class))
+                .containsKey(HttpHeaders.RETRY_AFTER);
+        assertThat(apiDocs.read("$.paths['/api/v1/jackpots'].get.responses['503'].headers", Map.class))
+                .containsKey(HttpHeaders.RETRY_AFTER);
+        assertThat(apiDocs.read("$.paths['/api/v1/bets/{betId}'].get.responses['404']", Map.class))
+                .as("only a 503 carries Retry-After").doesNotContainKey("headers");
+        assertThat(apiDocs.read("$.components.schemas.PlaceBetRequest.properties.betAmount.description",
+                String.class)).contains("at most 2 decimals");
     }
 
     private static String className(Object configValue) {

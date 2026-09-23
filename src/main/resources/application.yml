@@ -5,7 +5,9 @@ spring:
   threads.virtual.enabled: true
   lifecycle.timeout-per-shutdown-phase: 20s
   datasource:
-    url: jdbc:h2:mem:jackpot;MODE=PostgreSQL;DATABASE_TO_LOWER=TRUE;DEFAULT_NULL_ORDERING=HIGH;DB_CLOSE_DELAY=-1;LOCK_TIMEOUT=3000
+    # jackpot.h2.database only names the in-memory database (the tests give every Spring context its own); every
+    # other setting of this URL is what the tests run with
+    url: jdbc:h2:mem:${jackpot.h2.database:jackpot};MODE=PostgreSQL;DATABASE_TO_LOWER=TRUE;DEFAULT_NULL_ORDERING=HIGH;DB_CLOSE_DELAY=-1;LOCK_TIMEOUT=3000
     username: sa
     password: ""
     hikari: { maximum-pool-size: 10, minimum-idle: 2, connection-timeout: 2000, pool-name: jackpot-hikari }
@@ -21,6 +23,11 @@ spring:
       "[jackpot_variable_initial_pool]": ${JACKPOT_VARIABLE_INITIAL_POOL:5000.00}
       "[jackpot_mixed_initial_pool]": ${JACKPOT_MIXED_INITIAL_POOL:10000.00}
       "[jackpot_lucky_initial_pool]": ${JACKPOT_LUCKY_INITIAL_POOL:100.00}
+  jackson:
+    # Strict request bodies: a duplicate key is rejected instead of silently keeping the last value (a gateway or an
+    # audit log may have read the first one as the stake), and a JSON string is never coerced into a number.
+    read.strict-duplicate-detection: true
+    mapper.allow-coercion-of-scalars: false
   kafka:
     bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
     admin.fail-fast: true
@@ -39,7 +46,8 @@ spring:
         max.poll.records: 50
         max.poll.interval.ms: 300000
         spring.deserializer.key.delegate.class: org.apache.kafka.common.serialization.StringDeserializer
-        spring.deserializer.value.delegate.class: org.springframework.kafka.support.serializer.JacksonJsonDeserializer
+        # strict JSON like the API: duplicate keys and strings coerced into numbers fail (-> DLT with the raw bytes)
+        spring.deserializer.value.delegate.class: com.sporty.jackpot.messaging.BetPlacedEventDeserializer
         spring.json.value.default.type: com.sporty.jackpot.messaging.BetPlacedEvent
         spring.json.use.type.headers: false
         spring.json.trusted.packages: com.sporty.jackpot.messaging
@@ -47,7 +55,12 @@ spring:
 server.shutdown: graceful
 management:
   endpoints.web.exposure.include: health,info,metrics,prometheus
-  endpoint.health: { probes.enabled: true, show-details: always }
+  endpoint.health:
+    probes.enabled: true
+    show-details: always
+    # A stopped Kafka listener container (fatal listener error) fails liveness: the instance still serves HTTP, but
+    # never consumes again until it is restarted. Readiness keeps its default: HTTP traffic is still served correctly.
+    group.liveness.include: livenessState,kafkaListeners
 # OpenAPI (/v3/api-docs) and Swagger UI (/swagger-ui.html) are part of the API contract: enabled explicitly
 # (springdoc only enables them by default and warns about it at startup)
 springdoc:

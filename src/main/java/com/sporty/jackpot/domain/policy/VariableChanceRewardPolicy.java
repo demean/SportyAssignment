@@ -41,8 +41,8 @@ public record VariableChanceRewardPolicy(BigDecimal startChancePercentage, BigDe
     @Override
     public void validateFor(BigDecimal initialPool) {
         if (poolLimit.compareTo(initialPool) <= 0) {
-            throw new JackpotConfigurationException("poolLimit (" + poolLimit.toPlainString()
-                    + ") must be greater than the initial pool (" + initialPool.toPlainString() + ")");
+            throw new JackpotConfigurationException("poolLimit (" + poolLimit
+                    + ") must be greater than the initial pool (" + initialPool + ")");
         }
     }
 }

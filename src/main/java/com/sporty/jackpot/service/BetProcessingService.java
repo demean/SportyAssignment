@@ -71,6 +71,8 @@ public class BetProcessingService {
      * @return the processing result; a bet id seen before is a no-op ({@code DUPLICATE})
      * @throws org.springframework.dao.DataIntegrityViolationException when a concurrent transaction stored the same
      *                                                                 bet id first (the caller resolves the race)
+     * @throws com.sporty.jackpot.exception.JackpotConfigurationException when the jackpot's policies are inconsistent
+     *                                                                    with its initial pool; nothing is written
      */
     @Transactional(isolation = Isolation.READ_COMMITTED)
     public ProcessingResult process(Bet bet) {
@@ -104,6 +106,10 @@ public class BetProcessingService {
 
     private ProcessingResult contributeAndEvaluate(Bet bet, JackpotEntity jackpot, Instant now) {
         BigDecimal initialPool = jackpot.getInitialPoolAmount();
+        // the startup check does not protect running instances from a jackpot changed later (e.g. a migration of a
+        // rolling deploy): check again under the lock, before anything is written or drawn (non-retryable -> DLT)
+        JackpotConfigurationValidator.validate(jackpot.getId(), initialPool, jackpot.getContributionPolicy(),
+                jackpot.getRewardPolicy());
         BigDecimal contributionAmount = jackpot.getContributionPolicy()
                 .contributionAmount(bet.amount(), jackpot.getCurrentPoolAmount(), initialPool);
         BigDecimal poolAfter = jackpot.addContribution(contributionAmount, now);
