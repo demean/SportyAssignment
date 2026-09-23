@@ -1,9 +1,10 @@
 name: CI
 
+# Manually triggered (Actions tab -> CI -> Run workflow). To run it on every push, add:
+#   push:
+#     branches: [main]
+#   pull_request:
 on:
-  push:
-    branches: [main]
-  pull_request:
   workflow_dispatch:
 
 concurrency:

@@ -1,7 +1,5 @@
 # Jackpot Service
 
-[![CI](https://github.com/demean/SportyAssignment/actions/workflows/ci.yml/badge.svg)](https://github.com/demean/SportyAssignment/actions/workflows/ci.yml)
-
 A Spring Boot 4.1 / Java 21 backend for the Sporty Group Jackpot home assignment. It accepts bets over HTTP and
 publishes them to the Kafka topic `jackpot-bets`. A consumer then processes each bet in **one database transaction**,
 under the jackpot's row lock: (1) it adds the bet's contribution to the matching jackpot pool and (2) it evaluates the
@@ -775,9 +773,9 @@ DOCKER_HOST=unix://$HOME/.colima/default/docker.sock \
 ./mvnw verify -Pit              # the 997 tests + 7 in JackpotFlowIT (~1.5 min on the dev laptop with colima)
 ```
 
-**CI.** [GitHub Actions](.github/workflows/ci.yml) runs `./mvnw verify -Pit` (all suites, the coverage gate and the
-Testcontainers IT) and a Docker Compose end-to-end job (`docker compose up --build --wait`, then `scripts/demo.sh`) on
-every push to `main`.
+**CI.** [`.github/workflows/ci.yml`](.github/workflows/ci.yml) (GitHub Actions, started manually from the Actions tab)
+runs `./mvnw verify -Pit` (all suites, the coverage gate and the Testcontainers IT) and a Docker Compose end-to-end job
+(`docker compose up --build --wait`, then `scripts/demo.sh`) on a clean Ubuntu runner.
 
 **Coverage gate.** JaCoCo `check` runs in `verify` with BUNDLE minimums of **1.00 for INSTRUCTION, BRANCH, LINE,
 METHOD, CLASS and COMPLEXITY**, and nothing is excluded. Measured: 72 classes; 4,023 / 4,023 instructions, 140 / 140
