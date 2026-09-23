@@ -1,0 +1,13 @@
+# Production-like profile: PostgreSQL (horizontally scalable), management endpoints on a separate port.
+spring:
+  datasource:
+    url: ${POSTGRES_URL:jdbc:postgresql://localhost:5432/jackpot}
+    username: ${POSTGRES_USER:jackpot}
+    password: ${POSTGRES_PASSWORD:jackpot}
+    hikari:
+      connection-init-sql: SET lock_timeout = '3s'
+  kafka:
+    consumer:
+      group-id: ${JACKPOT_CONSUMER_GROUP:jackpot-service}
+management:
+  server.port: 8081

@@ -1,0 +1,25 @@
+# Build output
+target/
+.mvn/wrapper/maven-wrapper.jar
+
+# IDE
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+.classpath
+.project
+.settings/
+.factorypath
+.apt_generated/
+bin/
+out/
+.sts4-cache/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log

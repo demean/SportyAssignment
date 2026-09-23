@@ -1,0 +1,22 @@
+# Test-only overrides for EVERY test context (classpath:/config/application.yml wins over classpath:/application.yml).
+spring:
+  datasource:
+    # one isolated in-memory database per Spring test context: committed data never leaks between cached contexts
+    url: jdbc:h2:mem:test-${random.uuid};MODE=PostgreSQL;DATABASE_TO_LOWER=TRUE;DEFAULT_NULL_ORDERING=HIGH;DB_CLOSE_DELAY=-1;LOCK_TIMEOUT=3000
+  kafka:
+    # contexts without a broker start without touching Kafka; AbstractKafkaIntegrationTest turns both back on
+    listener.auto-startup: false
+    admin.auto-create: false
+jackpot:
+  kafka:
+    consumer.retry: { max-retries: 2, initial-interval: 10ms, multiplier: 2.0, max-interval: 50ms }
+logging:
+  level:
+    kafka: WARN
+    org.apache.kafka: WARN
+    org.apache.zookeeper: WARN
+    state.change.logger: WARN
+    kafka.server.ReplicaManager: "OFF"
+    kafka.log.LogManager: "OFF"
+    org.apache.kafka.common.utils.Utils: ERROR
+    org.apache.kafka.storage.internals.log.LogDirFailureChannel: "OFF"

@@ -1,0 +1,70 @@
+# Default profile: in-memory H2 (single instance only) + Kafka on localhost:9092.
+# Production-like setup: profile 'postgres' (application-postgres.yml).
+spring:
+  application.name: jackpot-service
+  threads.virtual.enabled: true
+  lifecycle.timeout-per-shutdown-phase: 20s
+  datasource:
+    url: jdbc:h2:mem:jackpot;MODE=PostgreSQL;DATABASE_TO_LOWER=TRUE;DEFAULT_NULL_ORDERING=HIGH;DB_CLOSE_DELAY=-1;LOCK_TIMEOUT=3000
+    username: sa
+    password: ""
+    hikari: { maximum-pool-size: 10, minimum-idle: 2, connection-timeout: 2000, pool-name: jackpot-hikari }
+  jpa:
+    open-in-view: false
+    hibernate.ddl-auto: validate
+    properties.hibernate: { jdbc.time_zone: UTC, jdbc.batch_size: 50 }
+  flyway:
+    locations: classpath:db/migration
+    # Initial pool values of the seeded jackpots (V2__seed_jackpots.sql); brackets keep the underscores in the keys.
+    placeholders:
+      "[jackpot_fixed_initial_pool]": ${JACKPOT_FIXED_INITIAL_POOL:1000.00}
+      "[jackpot_variable_initial_pool]": ${JACKPOT_VARIABLE_INITIAL_POOL:5000.00}
+      "[jackpot_mixed_initial_pool]": ${JACKPOT_MIXED_INITIAL_POOL:10000.00}
+      "[jackpot_lucky_initial_pool]": ${JACKPOT_LUCKY_INITIAL_POOL:100.00}
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    admin.fail-fast: true
+    template.observation-enabled: true
+    producer:
+      acks: all
+      # value serializer: KafkaConfig (byte[] pass-through + BetPlacedEvent as JSON without type headers)
+      properties: { enable.idempotence: true, linger.ms: 5, compression.type: lz4, max.block.ms: 3000, request.timeout.ms: 3000, delivery.timeout.ms: 8000 }
+    consumer:
+      group-id: ${JACKPOT_CONSUMER_GROUP:jackpot-service-local}
+      auto-offset-reset: earliest
+      key-deserializer: org.springframework.kafka.support.serializer.ErrorHandlingDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.ErrorHandlingDeserializer
+      properties:
+        partition.assignment.strategy: org.apache.kafka.clients.consumer.CooperativeStickyAssignor
+        max.poll.records: 50
+        max.poll.interval.ms: 300000
+        spring.deserializer.key.delegate.class: org.apache.kafka.common.serialization.StringDeserializer
+        spring.deserializer.value.delegate.class: org.springframework.kafka.support.serializer.JacksonJsonDeserializer
+        spring.json.value.default.type: com.sporty.jackpot.messaging.BetPlacedEvent
+        spring.json.use.type.headers: false
+        spring.json.trusted.packages: com.sporty.jackpot.messaging
+    listener: { concurrency: 3, observation-enabled: true }
+server.shutdown: graceful
+management:
+  endpoints.web.exposure.include: health,info,metrics,prometheus
+  endpoint.health: { probes.enabled: true, show-details: always }
+# OpenAPI (/v3/api-docs) and Swagger UI (/swagger-ui.html) are part of the API contract: enabled explicitly
+# (springdoc only enables them by default and warns about it at startup)
+springdoc:
+  api-docs.enabled: true
+  swagger-ui.enabled: true
+logging:
+  pattern:
+    # MDC of the Kafka listener: every log line written while processing a bet carries its bet and jackpot id
+    level: "%5p [betId=%X{betId:-} jackpotId=%X{jackpotId:-}]"
+jackpot:
+  kafka:
+    bets-topic: jackpot-bets
+    dead-letter-topic: jackpot-bets.DLT
+    partitions: 12
+    dead-letter-partitions: 3
+    replication-factor: 1
+    min-insync-replicas: 1
+    dead-letter-retention: 30d
+    publish-timeout: 12s
+    consumer.retry: { max-retries: 5, initial-interval: 500ms, multiplier: 2.0, max-interval: 30s }
